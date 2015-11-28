@@ -44,7 +44,6 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.collect.Sets.filter;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.COMMIT_ROOT;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.DOC_SIZE_THRESHOLD;
-import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.NUM_REVS_THRESHOLD;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.PREV_SPLIT_FACTOR;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.REVISIONS;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.SPLIT_RATIO;
@@ -70,7 +69,9 @@ class SplitOperations {
     private final NodeDocument doc;
     private final String path;
     private final String id;
+    private final Revision headRevision;
     private final RevisionContext context;
+    private final int numRevsThreshold;
     private Revision high;
     private Revision low;
     private int numValues;
@@ -84,19 +85,30 @@ class SplitOperations {
     private UpdateOp main;
 
     private SplitOperations(@Nonnull NodeDocument doc,
-                            @Nonnull RevisionContext context) {
+                            @Nonnull RevisionContext context,
+                            @Nonnull Revision headRevision,
+                            int numRevsThreshold) {
         this.doc = checkNotNull(doc);
         this.context = checkNotNull(context);
         this.path = doc.getPath();
         this.id = doc.getId();
+        this.headRevision = checkNotNull(headRevision);
+        this.numRevsThreshold = numRevsThreshold;
     }
 
     /**
      * Creates a list of update operations in case the given document requires
-     * a split.
+     * a split. A caller must explicitly pass a head revision even though it
+     * is available through the {@link RevisionContext}. The given head revision
+     * must reflect a head state before {@code doc} was retrieved from the
+     * document store. This is important in order to maintain consistency.
+     * See OAK-3081 for details.
      *
      * @param doc a main document.
      * @param context the revision context.
+     * @param headRevision the head revision before the document was retrieved
+     *                     from the document store.
+     * @param numRevsThreshold only split off at least this number of revisions.
      * @return list of update operations. An empty list indicates the document
      *          does not require a split.
      * @throws IllegalArgumentException if the given document is a split
@@ -104,12 +116,14 @@ class SplitOperations {
      */
     @Nonnull
     static List<UpdateOp> forDocument(@Nonnull NodeDocument doc,
-                                      @Nonnull RevisionContext context) {
+                                      @Nonnull RevisionContext context,
+                                      @Nonnull Revision headRevision,
+                                      int numRevsThreshold) {
         if (doc.isSplitDocument()) {
             throw new IllegalArgumentException(
                     "Not a main document: " + doc.getId());
         }
-        return new SplitOperations(doc, context).create();
+        return new SplitOperations(doc, context, headRevision, numRevsThreshold).create();
 
     }
 
@@ -158,7 +172,7 @@ class SplitOperations {
         SortedMap<Revision, Range> previous = doc.getPreviousRanges();
         // only consider if there are enough commits,
         // unless document is really big
-        return doc.getLocalRevisions().size() + doc.getLocalCommitRoot().size() > NUM_REVS_THRESHOLD
+        return doc.getLocalRevisions().size() + doc.getLocalCommitRoot().size() > numRevsThreshold
                 || doc.getMemory() >= DOC_SIZE_THRESHOLD
                 || previous.size() >= PREV_SPLIT_FACTOR
                 || !doc.getStalePrev().isEmpty();
@@ -219,6 +233,7 @@ class SplitOperations {
         committedChanges.put(REVISIONS, revisions);
         NavigableMap<Revision, String> commitRoot =
                 new TreeMap<Revision, String>(context.getRevisionComparator());
+        boolean mostRecent = true;
         for (Map.Entry<Revision, String> entry : doc.getLocalCommitRoot().entrySet()) {
             Revision r = entry.getKey();
             if (splitRevs.contains(r)) {
@@ -226,9 +241,13 @@ class SplitOperations {
                 numValues++;
             } else if (r.getClusterId() == context.getClusterId() 
                     && !changes.contains(r)) {
-                // OAK-2528: _commitRoot entry without associated
-                // change -> consider as garbage
-                addGarbage(r, COMMIT_ROOT);
+                // OAK-2528: _commitRoot entry without associated change
+                // consider all but most recent as garbage (OAK-3333)
+                if (mostRecent) {
+                    mostRecent = false;
+                } else {
+                    addGarbage(r, COMMIT_ROOT);
+                }
             }
         }
         committedChanges.put(COMMIT_ROOT, commitRoot);
@@ -292,7 +311,7 @@ class SplitOperations {
         UpdateOp main = null;
         // check if we have enough data to split off
         if (high != null && low != null
-                && (numValues >= NUM_REVS_THRESHOLD
+                && (numValues >= numRevsThreshold
                 || doc.getMemory() > DOC_SIZE_THRESHOLD)) {
             // enough changes to split off
             // move to another document
@@ -322,11 +341,11 @@ class SplitOperations {
             }
             // check size of old document
             NodeDocument oldDoc = new NodeDocument(STORE);
-            UpdateUtils.applyChanges(oldDoc, old, context.getRevisionComparator());
+            UpdateUtils.applyChanges(oldDoc, old);
             setSplitDocProps(doc, oldDoc, old, high);
             // only split if enough of the data can be moved to old document
             if (oldDoc.getMemory() > doc.getMemory() * SPLIT_RATIO
-                    || numValues >= NUM_REVS_THRESHOLD) {
+                    || numValues >= numRevsThreshold) {
                 splitOps.add(old);
             } else {
                 main = null;
@@ -392,9 +411,10 @@ class SplitOperations {
     }
     
     private boolean isGarbage(Revision rev) {
-        Revision head = context.getHeadRevision();
         Comparator<Revision> comp = context.getRevisionComparator();
-        if (comp.compare(head, rev) <= 0) {
+        // use headRevision as passed in the constructor instead
+        // of the head revision from the RevisionContext. see OAK-3081
+        if (comp.compare(headRevision, rev) <= 0) {
             // this may be an in-progress commit
             return false;
         }

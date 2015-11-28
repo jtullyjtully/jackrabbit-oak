@@ -16,6 +16,7 @@
  */
 package org.apache.jackrabbit.oak.plugins.segment;
 
+import static org.apache.jackrabbit.oak.commons.PathUtils.concat;
 import static com.google.common.collect.Lists.newArrayList;
 import static com.google.common.collect.Maps.newHashMap;
 import static org.apache.jackrabbit.oak.api.Type.BINARIES;
@@ -27,6 +28,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+import com.google.common.base.Predicate;
+import com.google.common.base.Predicates;
+import com.google.common.hash.Hashing;
 import org.apache.jackrabbit.oak.api.Blob;
 import org.apache.jackrabbit.oak.api.PropertyState;
 import org.apache.jackrabbit.oak.api.Type;
@@ -40,8 +44,6 @@ import org.apache.jackrabbit.oak.spi.state.NodeBuilder;
 import org.apache.jackrabbit.oak.spi.state.NodeState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.google.common.hash.Hashing;
 
 /**
  * Tool for compacting segments.
@@ -64,6 +66,14 @@ public class Compactor {
     private final CompactionMap map;
 
     /**
+     * Filters nodes that will be included in the compaction map, allowing for
+     * optimization in case of an offline compaction
+     */
+    private Predicate<NodeState> includeInMap = Predicates.alwaysTrue();
+
+    private final ProgressTracker progress = new ProgressTracker();
+
+    /**
      * Map from {@link #getBlobKey(Blob) blob keys} to matching compacted
      * blob record identifiers. Used to de-duplicate copies of the same
      * binary values.
@@ -77,13 +87,16 @@ public class Compactor {
     private final boolean cloneBinaries;
 
     public Compactor(SegmentWriter writer) {
-        this(writer, false);
+        this(writer, false, false);
     }
 
-    public Compactor(SegmentWriter writer, boolean cloneBinaries) {
+    public Compactor(SegmentWriter writer, boolean cloneBinaries, boolean offlineCompaction) {
         this.writer = writer;
-        this.map = new CompactionMap(100000, writer.getTracker());
+        this.map = new CompactionMap(writer.getTracker());
         this.cloneBinaries = cloneBinaries;
+        if (offlineCompaction) {
+            includeInMap = new OfflineCompactionPredicate();
+        }
     }
 
     protected SegmentNodeBuilder process(NodeState before, NodeState after) {
@@ -94,8 +107,10 @@ public class Compactor {
     }
 
     public SegmentNodeState compact(NodeState before, NodeState after) {
+        progress.start();
         SegmentNodeState compacted = process(before, after).getNodeState();
         writer.flush();
+        progress.stop();
         return compacted;
     }
 
@@ -106,23 +121,55 @@ public class Compactor {
 
     private class CompactDiff extends ApplyDiff {
 
+        /**
+         * Current processed path, or null if the trace log is not enabled at
+         * the beginning of the compaction call. The null check will also be
+         * used to verify if a trace log will be needed or not
+         */
+        private final String path;
+
         CompactDiff(NodeBuilder builder) {
             super(builder);
+            if (log.isTraceEnabled()) {
+                this.path = "/";
+            } else {
+                this.path = null;
+            }
+        }
+
+        private CompactDiff(NodeBuilder builder, String path, String childName) {
+            super(builder);
+            if (path != null) {
+                this.path = concat(path, childName);
+            } else {
+                this.path = null;
+            }
         }
 
         @Override
         public boolean propertyAdded(PropertyState after) {
+            if (path != null) {
+                log.trace("propertyAdded {}/{}", path, after.getName());
+            }
+            progress.onProperty();
             return super.propertyAdded(compact(after));
         }
 
         @Override
-        public boolean propertyChanged(
-                PropertyState before, PropertyState after) {
+        public boolean propertyChanged(PropertyState before, PropertyState after) {
+            if (path != null) {
+                log.trace("propertyChanged {}/{}", path, after.getName());
+            }
+            progress.onProperty();
             return super.propertyChanged(before, compact(after));
         }
 
         @Override
         public boolean childNodeAdded(String name, NodeState after) {
+            if (path != null) {
+                log.trace("childNodeAdded {}/{}", path, name);
+            }
+            progress.onNode();
             RecordId id = null;
             if (after instanceof SegmentNodeState) {
                 id = ((SegmentNodeState) after).getRecordId();
@@ -135,12 +182,12 @@ public class Compactor {
 
             NodeBuilder child = EmptyNodeState.EMPTY_NODE.builder();
             boolean success = EmptyNodeState.compareAgainstEmptyState(after,
-                    new CompactDiff(child));
+                    new CompactDiff(child, path, name));
 
             if (success) {
                 SegmentNodeState state = writer.writeNode(child.getNodeState());
                 builder.setChildNode(name, state);
-                if (id != null) {
+                if (id != null && includeInMap.apply(state)) {
                     map.put(id, state.getRecordId());
                 }
             }
@@ -151,6 +198,11 @@ public class Compactor {
         @Override
         public boolean childNodeChanged(
                 String name, NodeState before, NodeState after) {
+            if (path != null) {
+                log.trace("childNodeChanged {}/{}", path, name);
+            }
+            progress.onNode();
+
             RecordId id = null;
             if (after instanceof SegmentNodeState) {
                 id = ((SegmentNodeState) after).getRecordId();
@@ -163,7 +215,7 @@ public class Compactor {
 
             NodeBuilder child = builder.getChildNode(name);
             boolean success = after.compareAgainstBaseState(before,
-                    new CompactDiff(child));
+                    new CompactDiff(child, path, name));
 
             if (success) {
                 RecordId compactedId = writer.writeNode(child.getNodeState())
@@ -205,7 +257,7 @@ public class Compactor {
     private Blob compact(Blob blob) {
         if (blob instanceof SegmentBlob) {
             SegmentBlob sb = (SegmentBlob) blob;
-
+            progress.onBinary();
             try {
                 // else check if we've already cloned this specific record
                 RecordId id = sb.getRecordId();
@@ -261,6 +313,83 @@ public class Compactor {
             return blob.length() + ":" + Hashing.sha1().hashBytes(buffer, 0, n);
         } finally {
             stream.close();
+        }
+    }
+
+    private class ProgressTracker {
+
+        private final long logAt = Long.getLong("compaction-progress-log",
+                150000);
+
+        private long start = 0;
+
+        private long nodes = 0;
+        private long properties = 0;
+        private long binaries = 0;
+
+        void start() {
+            nodes = 0;
+            properties = 0;
+            binaries = 0;
+            start = System.currentTimeMillis();
+        }
+
+        void onNode() {
+            if (++nodes % logAt == 0) {
+                logProgress(start, false);
+                start = System.currentTimeMillis();
+            }
+        }
+
+        void onProperty() {
+            properties++;
+        }
+
+        void onBinary() {
+            binaries++;
+        }
+
+        void stop() {
+            logProgress(start, true);
+        }
+
+        private void logProgress(long start, boolean done) {
+            log.debug(
+                    "Compacted {} nodes, {} properties, {} binaries in {} ms.",
+                    nodes, properties, binaries, System.currentTimeMillis()
+                            - start);
+            if (done) {
+                log.info(
+                        "Finished compaction: {} nodes, {} properties, {} binaries.",
+                        nodes, properties, binaries);
+            }
+        }
+    }
+
+    private static class OfflineCompactionPredicate implements
+            Predicate<NodeState> {
+
+        /**
+         * over 64K in size, node will be included in the compaction map
+         */
+        private static final long offlineThreshold = 65536;
+
+        @Override
+        public boolean apply(NodeState state) {
+            if (state.getChildNodeCount(2) > 1) {
+                return true;
+            }
+            long count = 0;
+            for (PropertyState ps : state.getProperties()) {
+                for (int i = 0; i < ps.count(); i++) {
+                    long size = ps.size(i);
+                    count += size;
+                    if (size >= offlineThreshold || count >= offlineThreshold) {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
     }
 

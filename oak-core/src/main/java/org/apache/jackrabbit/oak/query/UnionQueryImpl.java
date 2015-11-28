@@ -22,6 +22,7 @@ import java.util.List;
 
 import org.apache.jackrabbit.oak.api.PropertyValue;
 import org.apache.jackrabbit.oak.api.Result;
+import org.apache.jackrabbit.oak.api.Result.SizePrecision;
 import org.apache.jackrabbit.oak.api.Tree;
 import org.apache.jackrabbit.oak.query.ast.ColumnImpl;
 import org.apache.jackrabbit.oak.query.ast.OrderingImpl;
@@ -85,13 +86,19 @@ public class UnionQueryImpl implements Query {
     @Override
     public void setLimit(long limit) {
         this.limit = limit;
-        left.setLimit(limit);
-        right.setLimit(limit);
+        applyLimitOffset();
     }
 
     @Override
     public void setOffset(long offset) {
         this.offset = offset;
+        applyLimitOffset();
+    }
+
+    private void applyLimitOffset() {
+        long subqueryLimit = QueryImpl.saturatedAdd(limit, offset);
+        left.setLimit(subqueryLimit);
+        right.setLimit(subqueryLimit);
     }
 
     @Override
@@ -144,7 +151,25 @@ public class UnionQueryImpl implements Query {
     public long getSize() {
         return size;
     }
-
+    
+    @Override
+    public long getSize(SizePrecision precision, long max) {
+        // Note: for "unionAll == false", overlapping entries are counted twice
+        // (this can result in a larger reported size, but it is not a security problem)
+        
+        // ensure the queries are both executed, otherwise the cursor is not set,
+        // and so the size would be -1
+        left.executeQuery().getRows().iterator().hasNext();
+        right.executeQuery().getRows().iterator().hasNext();
+        long a = left.getSize(precision, max);
+        long b = right.getSize(precision, max);
+        if (a < 0 || b < 0) {
+            return -1;
+        }
+        long total = QueryImpl.saturatedAdd(a, b);
+        return Math.min(limit, total);
+    }
+    
     @Override
     public void setExplain(boolean explain) {
         this.explain = explain;

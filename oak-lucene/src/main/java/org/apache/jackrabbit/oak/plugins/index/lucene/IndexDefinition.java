@@ -624,13 +624,16 @@ class IndexDefinition implements Aggregate.AggregateMapper{
         private final List<NamePattern> namePatterns;
         private final List<PropertyDefinition> nullCheckEnabledProperties;
         private final List<PropertyDefinition> notNullCheckEnabledProperties;
+        private final List<PropertyDefinition> nodeScopeAnalyzedProps;
         private final boolean indexesAllNodesOfMatchingType;
+        private final boolean nodeNameIndexed;
 
         final float boost;
         final boolean inherited;
         final int propertyTypes;
         final boolean fulltextEnabled;
         final boolean propertyIndexEnabled;
+        final boolean nodeFullTextIndexed;
 
         final Aggregate aggregate;
         final Aggregate propAggregate;
@@ -646,17 +649,22 @@ class IndexDefinition implements Aggregate.AggregateMapper{
             List<NamePattern> namePatterns = newArrayList();
             List<PropertyDefinition> nonExistentProperties = newArrayList();
             List<PropertyDefinition> existentProperties = newArrayList();
+            List<PropertyDefinition> nodeScopeAnalyzedProps = newArrayList();
             List<Aggregate.Include> propIncludes = newArrayList();
-            this.propConfigs = collectPropConfigs(config, namePatterns, propIncludes, nonExistentProperties, existentProperties);
+            this.propConfigs = collectPropConfigs(config, namePatterns, propIncludes, nonExistentProperties,
+                    existentProperties, nodeScopeAnalyzedProps);
             this.propAggregate = new Aggregate(nodeTypeName, propIncludes);
             this.aggregate = combine(propAggregate, nodeTypeName);
 
             this.namePatterns = ImmutableList.copyOf(namePatterns);
+            this.nodeScopeAnalyzedProps = ImmutableList.copyOf(nodeScopeAnalyzedProps);
             this.nullCheckEnabledProperties = ImmutableList.copyOf(nonExistentProperties);
             this.notNullCheckEnabledProperties = ImmutableList.copyOf(existentProperties);
             this.fulltextEnabled = aggregate.hasNodeAggregates() || hasAnyFullTextEnabledProperty();
+            this.nodeFullTextIndexed = aggregate.hasNodeAggregates() || anyNodeScopeIndexedProperty();
             this.propertyIndexEnabled = hasAnyPropertyIndexConfigured();
-            this.indexesAllNodesOfMatchingType = allMatchingNodeByTypeIndexed();
+            this.indexesAllNodesOfMatchingType = areAlMatchingNodeByTypeIndexed();
+            this.nodeNameIndexed = getOptionalValue(config, LuceneIndexConstants.INDEX_NODE_NAME, false);
             validateRuleDefinition();
         }
 
@@ -679,9 +687,12 @@ class IndexDefinition implements Aggregate.AggregateMapper{
             this.propAggregate = original.propAggregate;
             this.nullCheckEnabledProperties = original.nullCheckEnabledProperties;
             this.notNullCheckEnabledProperties = original.notNullCheckEnabledProperties;
+            this.nodeScopeAnalyzedProps = original.nodeScopeAnalyzedProps;
             this.aggregate = combine(propAggregate, nodeTypeName);
             this.fulltextEnabled = aggregate.hasNodeAggregates() || original.fulltextEnabled;
-            this.indexesAllNodesOfMatchingType = allMatchingNodeByTypeIndexed();
+            this.nodeFullTextIndexed = aggregate.hasNodeAggregates() || original.nodeFullTextIndexed;
+            this.indexesAllNodesOfMatchingType = areAlMatchingNodeByTypeIndexed();
+            this.nodeNameIndexed = original.nodeNameIndexed;
         }
 
         /**
@@ -714,6 +725,10 @@ class IndexDefinition implements Aggregate.AggregateMapper{
             return notNullCheckEnabledProperties;
         }
 
+        public List<PropertyDefinition> getNodeScopeAnalyzedProps() {
+            return nodeScopeAnalyzedProps;
+        }
+
         @Override
         public String toString() {
             String str = "IndexRule: "+ nodeTypeName;
@@ -736,6 +751,12 @@ class IndexDefinition implements Aggregate.AggregateMapper{
          *         <code>false</code> otherwise.
          */
         public boolean appliesTo(Tree state) {
+            for (String mixinName : getMixinTypeNames(state)){
+                if (nodeTypeName.equals(mixinName)){
+                    return true;
+                }
+            }
+
             if (!nodeTypeName.equals(getPrimaryTypeName(state))) {
                 return false;
             }
@@ -755,9 +776,26 @@ class IndexDefinition implements Aggregate.AggregateMapper{
 
         }
 
+        public boolean isNodeNameIndexed() {
+            return nodeNameIndexed;
+        }
+
+        /**
+         * Returns true if the rule has any property definition which enables
+         * evaluation of fulltext related clauses
+         */
         public boolean isFulltextEnabled() {
             return fulltextEnabled;
         }
+
+        /**
+         * Returns true if a fulltext field for the node would be created
+         * for any node matching the current rule.
+         */
+        public boolean isNodeFullTextIndexed() {
+            return nodeFullTextIndexed;
+        }
+
         /**
          * @param propertyName name of a property.
          * @return the property configuration or <code>null</code> if this
@@ -808,7 +846,8 @@ class IndexDefinition implements Aggregate.AggregateMapper{
         private Map<String, PropertyDefinition> collectPropConfigs(NodeState config, List<NamePattern> patterns,
                                                                    List<Aggregate.Include> propAggregate,
                                                                    List<PropertyDefinition> nonExistentProperties,
-                                                                   List<PropertyDefinition> existentProperties) {
+                                                                   List<PropertyDefinition> existentProperties,
+                                                                   List<PropertyDefinition> nodeScopeAnalyzedProps) {
             Map<String, PropertyDefinition> propDefns = newHashMap();
             NodeState propNode = config.getChildNode(LuceneIndexConstants.PROP_NODE);
 
@@ -845,6 +884,13 @@ class IndexDefinition implements Aggregate.AggregateMapper{
                     if (pd.notNullCheckEnabled){
                         existentProperties.add(pd);
                     }
+
+                    //Include props with name, boosted and nodeScopeIndex
+                    if (pd.nodeScopeIndex
+                            && pd.analyzed
+                            && !pd.isRegexp){
+                        nodeScopeAnalyzedProps.add(pd);
+                    }
                 }
             }
             return ImmutableMap.copyOf(propDefns);
@@ -880,10 +926,26 @@ class IndexDefinition implements Aggregate.AggregateMapper{
             return false;
         }
 
-        private boolean allMatchingNodeByTypeIndexed(){
-            //Incase of fulltext all nodes matching this rule type would be indexed
-            //and would have entry in the index
-            if (fulltextEnabled){
+        private boolean anyNodeScopeIndexedProperty(){
+            //Check if there is any nodeScope indexed property as
+            //for such case a node would always be indexed
+            for (PropertyDefinition pd : propConfigs.values()){
+                if (pd.nodeScopeIndex){
+                    return true;
+                }
+            }
+
+            for (NamePattern np : namePatterns){
+                if (np.getConfig().nodeScopeIndex){
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private boolean areAlMatchingNodeByTypeIndexed(){
+            if (nodeFullTextIndexed){
                 return true;
             }
 
@@ -1152,6 +1214,9 @@ class IndexDefinition implements Aggregate.AggregateMapper{
     }
 
     private static String determineIndexName(NodeState defn, String indexPath) {
+        if (indexPath == null){
+            indexPath = defn.getString(LuceneIndexConstants.INDEX_PATH);
+        }
         String indexName = defn.getString(PROP_NAME);
         if (indexName ==  null){
             if (indexPath == null){
@@ -1218,7 +1283,7 @@ class IndexDefinition implements Aggregate.AggregateMapper{
     }
 
     private static Iterable<String> getMixinTypeNames(Tree tree) {
-        PropertyState property = tree.getProperty(JcrConstants.JCR_MIMETYPE);
+        PropertyState property = tree.getProperty(JcrConstants.JCR_MIXINTYPES);
         return property != null ? property.getValue(Type.NAMES) : Collections.<String>emptyList();
     }
 
@@ -1260,7 +1325,7 @@ class IndexDefinition implements Aggregate.AggregateMapper{
 
     private static boolean hasFulltextEnabledIndexRule(List<IndexingRule> rules) {
         for (IndexingRule rule : rules){
-            if (rule.fulltextEnabled){
+            if (rule.isFulltextEnabled()){
                 return true;
             }
         }

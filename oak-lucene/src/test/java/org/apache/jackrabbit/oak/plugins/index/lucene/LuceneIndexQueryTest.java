@@ -19,6 +19,7 @@ package org.apache.jackrabbit.oak.plugins.index.lucene;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Iterator;
 import java.util.List;
@@ -27,6 +28,7 @@ import org.apache.jackrabbit.oak.Oak;
 import org.apache.jackrabbit.oak.api.ContentRepository;
 import org.apache.jackrabbit.oak.api.PropertyState;
 import org.apache.jackrabbit.oak.api.Tree;
+import org.apache.jackrabbit.oak.api.Type;
 import org.apache.jackrabbit.oak.plugins.nodetype.write.InitialContent;
 import org.apache.jackrabbit.oak.query.AbstractQueryTest;
 import org.apache.jackrabbit.oak.spi.commit.Observer;
@@ -35,6 +37,7 @@ import org.apache.jackrabbit.oak.spi.security.OpenSecurityProvider;
 import org.junit.Ignore;
 import org.junit.Test;
 
+import static com.google.common.collect.ImmutableList.of;
 import static java.util.Arrays.asList;
 import static junit.framework.Assert.assertEquals;
 import static org.apache.jackrabbit.JcrConstants.JCR_PRIMARYTYPE;
@@ -61,6 +64,7 @@ public class LuceneIndexQueryTest extends AbstractQueryTest {
         indexDefn.setProperty(LuceneIndexConstants.EVALUATE_PATH_RESTRICTION, true);
 
         Tree props = TestUtil.newRulePropTree(indexDefn, "nt:base");
+        props.getParent().setProperty(LuceneIndexConstants.INDEX_NODE_NAME, true);
         TestUtil.enablePropertyIndex(props, "c1/p", false);
         TestUtil.enableForFullText(props, LuceneIndexConstants.REGEX_ALL_PROPS, true);
 
@@ -472,7 +476,34 @@ public class LuceneIndexQueryTest extends AbstractQueryTest {
      
         assertQuery(statement, SQL2, expected);
     }
-    
+
+    @Test
+    public void testMultiValuedPropUpdate() throws Exception {
+        Tree test = root.getTree("/").addChild("test");
+        String child = "child";
+        String mulValuedProp = "prop";
+        test.addChild(child).setProperty(mulValuedProp, of("foo","bar"), Type.STRINGS);
+        root.commit();
+        assertQuery(
+                "/jcr:root//*[jcr:contains(@" + mulValuedProp + ", 'foo')]",
+                "xpath", of("/test/" + child));
+        test.getChild(child).setProperty(mulValuedProp, new ArrayList<String>(), Type.STRINGS);
+        root.commit();
+        assertQuery("/jcr:root//*[jcr:contains(@" + mulValuedProp + ", 'foo')]", "xpath", new ArrayList<String>());
+
+        test.getChild(child).setProperty(mulValuedProp, of("bar"), Type.STRINGS);
+        root.commit();
+        assertQuery(
+                "/jcr:root//*[jcr:contains(@" + mulValuedProp + ", 'foo')]",
+                "xpath", new ArrayList<String>());
+
+        test.getChild(child).removeProperty(mulValuedProp);
+        root.commit();
+        assertQuery(
+            "/jcr:root//*[jcr:contains(@" + mulValuedProp + ", 'foo')]",
+            "xpath", new ArrayList<String>());
+    }
+
     @SuppressWarnings("unused")
     private static void walktree(final Tree t) {
         System.out.println("+ " + t.getPath());
@@ -482,5 +513,47 @@ public class LuceneIndexQueryTest extends AbstractQueryTest {
         for (Tree t1 : t.getChildren()) {
             walktree(t1);
         }
+    }
+    
+    private static Tree child(Tree t, String n, String type) {
+        Tree t1 = t.addChild(n);
+        t1.setProperty(JCR_PRIMARYTYPE, type, Type.NAME);
+        return t1;
+    }
+
+    @Test
+    public void oak3371() throws Exception {
+        setTraversalEnabled(false);
+        Tree t, t1;
+        
+        t = root.getTree("/");
+        t = child(t, "test", NT_UNSTRUCTURED);
+        t1 = child(t, "a", NT_UNSTRUCTURED);
+        t1.setProperty("foo", "bar");
+        t1 = child(t, "b", NT_UNSTRUCTURED);
+        t1.setProperty("foo", "cat");
+        t1 = child(t, "c", NT_UNSTRUCTURED);
+        t1 = child(t, "d", NT_UNSTRUCTURED);
+        t1.setProperty("foo", "bar cat");
+
+        root.commit();
+
+        assertQuery(
+            "SELECT * FROM [nt:unstructured] WHERE ISDESCENDANTNODE('/test') AND CONTAINS(foo, 'bar')",
+            of("/test/a", "/test/d"));
+
+        assertQuery(
+            "SELECT * FROM [nt:unstructured] WHERE ISDESCENDANTNODE('/test') AND NOT CONTAINS(foo, 'bar')",
+            of("/test/b", "/test/c"));
+
+        assertQuery(
+            "SELECT * FROM [nt:unstructured] WHERE ISDESCENDANTNODE('/test') AND CONTAINS(foo, 'bar cat')",
+            of("/test/d"));
+
+        assertQuery(
+            "SELECT * FROM [nt:unstructured] WHERE ISDESCENDANTNODE('/test') AND NOT CONTAINS(foo, 'bar cat')",
+            of("/test/c"));
+
+        setTraversalEnabled(true);
     }
 }

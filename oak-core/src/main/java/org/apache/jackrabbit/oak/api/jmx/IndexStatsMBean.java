@@ -19,9 +19,6 @@ package org.apache.jackrabbit.oak.api.jmx;
 
 import javax.management.openmbean.CompositeData;
 
-import org.apache.jackrabbit.oak.commons.jmx.Description;
-import org.apache.jackrabbit.oak.commons.jmx.Name;
-
 public interface IndexStatsMBean {
 
     String TYPE = "IndexStats";
@@ -134,6 +131,13 @@ public interface IndexStatsMBean {
     CompositeData getExecutionTime();
 
     /**
+     * Returns the number of indexed nodes as a {@link org.apache.jackrabbit.api.stats.TimeSeries}.
+     *
+     * @return the indexed nodes time series
+     */
+    CompositeData getIndexedNodesCount();
+
+    /**
      * Returns the consolidated execution stats since last reset
      * @return consolidated execution stats
      */
@@ -145,21 +149,32 @@ public interface IndexStatsMBean {
     void resetConsolidatedExecutionStats();
 
     /**
-     * Splits the current indexing tasks into 2, indexes that are passed in as
-     * an input will have their 'async' property updated to
-     * {@code newIndexTaskName}.
-     * 
-     * Note that this call will *not* bootstrap a new indexing task for the
-     * given name.
+     * @return true if the indexing job is failing
      */
-    void splitIndexingTask(
-            @Name("paths") @Description("Comma separated list of paths of the index definitions") String paths,
-            @Name("newIndexTaskName") @Description("The indexing task name set on the async property") String newIndexTaskName);
+    boolean isFailing();
 
     /**
-     * Starts a new background indexing task and registers the JMX MBeans for it
-     * 
+     * @return The time the indexing job stared failing, or {@code ""} if the
+     *         job is not currently failing.
      */
-    void registerAsyncIndexer(@Name("name") String name,
-            @Name("delayInSeconds") long delayInSeconds);
+    String getFailingSince();
+
+    /**
+     * @return the number of consecutive failed executions or {@code 0} if the
+     *         job is not currently failing.
+     */
+    long getConsecutiveFailedExecutions();
+
+    /**
+     * @return the latest indexing error seen, will not be reset once the job
+     *         starts working again
+     */
+    String getLatestError();
+
+    /**
+     * @return the time when the latest indexing error has been seen, will not
+     *         be reset once the job starts working again
+     */
+    String getLatestErrorTime();
+
 }

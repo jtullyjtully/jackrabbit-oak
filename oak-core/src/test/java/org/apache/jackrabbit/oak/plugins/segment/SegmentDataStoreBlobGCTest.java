@@ -20,7 +20,9 @@ package org.apache.jackrabbit.oak.plugins.segment;
 
 import static org.apache.commons.io.FileUtils.byteCountToDisplaySize;
 import static org.apache.jackrabbit.oak.plugins.blob.datastore.SharedDataStoreUtils.SharedStoreRecordType.REPOSITORY;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assume.assumeTrue;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -33,14 +35,22 @@ import java.util.List;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import com.google.common.base.Stopwatch;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-
-import com.google.common.util.concurrent.MoreExecutors;
+import com.google.common.io.Closeables;
 import org.apache.commons.io.FileUtils;
 import org.apache.jackrabbit.oak.api.CommitFailedException;
+import org.apache.jackrabbit.oak.plugins.blob.BlobReferenceRetriever;
+import org.apache.jackrabbit.oak.plugins.blob.GarbageCollectorFileState;
 import org.apache.jackrabbit.oak.plugins.blob.MarkSweepGarbageCollector;
 import org.apache.jackrabbit.oak.plugins.blob.SharedDataStore;
 import org.apache.jackrabbit.oak.plugins.blob.datastore.DataStoreBlobStore;
@@ -58,8 +68,6 @@ import org.junit.After;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import javax.annotation.Nonnull;
 
 /**
  * Tests for SegmentNodeStore DataStore GC
@@ -93,17 +101,15 @@ public class SegmentDataStoreBlobGCTest {
         return new File("target", "DataStoreBlobGCTest");
     }
 
-    public HashSet<String> setUp() throws Exception {
+    public DataStoreState setUp() throws Exception {
         blobStore = DataStoreUtils.getBlobStore();
         nodeStore = getNodeStore(blobStore);
         startDate = new Date();
 
-        HashSet<String> set = new HashSet<String>();
-
         NodeBuilder a = nodeStore.getRoot().builder();
 
         /* Create garbage by creating in-lined blobs (size < 16KB) */
-        int number = 10000;
+        int number = 4000;
         NodeBuilder content = a.child("content");
         for (int i = 0; i < number; i++) {
             NodeBuilder c = content.child("x" + i);
@@ -128,32 +134,32 @@ public class SegmentDataStoreBlobGCTest {
 
         /* Create and delete nodes with blobs stored in DS*/
         int maxDeleted  = 5;
-        number = 10;
-        // track the number of the assets to be deleted
+        int numBlobs = 10;
         List<Integer> processed = Lists.newArrayList();
         Random rand = new Random();
         for (int i = 0; i < maxDeleted; i++) {
-            int n = rand.nextInt(number);
+            int n = rand.nextInt(numBlobs);
             if (!processed.contains(n)) {
                 processed.add(n);
             }
         }
 
-        List<String> createdBlobs = Lists.newArrayList();
-        for (int i = 0; i < number; i++) {
+        DataStoreState state = new DataStoreState();
+        for (int i = 0; i < numBlobs; i++) {
             SegmentBlob b = (SegmentBlob) nodeStore.createBlob(randomStream(i, 16516));
-            createdBlobs.add(b.getBlobId());
-            if (!processed.contains(i)) {
-                Iterator<String> idIter = blobStore
-                        .resolveChunks(b.getBlobId());
-                while (idIter.hasNext()) {
-                    set.add(idIter.next());
+            Iterator<String> idIter = blobStore.resolveChunks(b.getBlobId());
+            while (idIter.hasNext()) {
+                String chunk = idIter.next();
+                state.blobsAdded.add(chunk);
+                if (!processed.contains(i)) {
+                    state.blobsPresent.add(chunk);
                 }
             }
             a.child("c" + i).setProperty("x", b);
         }
+
         nodeStore.merge(a, EmptyHook.INSTANCE, CommitInfo.EMPTY);
-        log.info("Created blobs : {}", createdBlobs.size());
+        log.info("Created blobs : {}", state.blobsAdded.size());
 
         for (int id : processed) {
             delete("c" + id);
@@ -165,7 +171,12 @@ public class SegmentDataStoreBlobGCTest {
         store.maybeCompact(false);
         store.cleanup();
 
-        return set;
+        return state;
+    }
+
+    private class DataStoreState {
+        Set<String> blobsAdded = Sets.newHashSet();
+        Set<String> blobsPresent = Sets.newHashSet();
     }
 
     private void delete(String nodeId) throws CommitFailedException {
@@ -177,7 +188,23 @@ public class SegmentDataStoreBlobGCTest {
 
     @Test
     public void gc() throws Exception {
-        HashSet<String> remaining = setUp();
+        DataStoreState state = setUp();
+        log.info("{} blobs that should remain after gc : {}", state.blobsPresent.size(), state.blobsPresent);
+        log.info("{} blobs for nodes which are deleted : {}", state.blobsPresent.size(), state.blobsPresent);
+        Set<String> existingAfterGC = gcInternal(0);
+        assertTrue(Sets.symmetricDifference(state.blobsPresent, existingAfterGC).isEmpty());
+    }
+
+    @Test
+    public void noGc() throws Exception {
+        DataStoreState state = setUp();
+        log.info("{} blobs that should remain after gc : {}", state.blobsAdded.size(), state.blobsAdded);
+        log.info("{} blobs for nodes which are deleted : {}", state.blobsPresent.size(), state.blobsPresent);
+        Set<String> existingAfterGC = gcInternal(86400);
+        assertTrue(Sets.symmetricDifference(state.blobsAdded, existingAfterGC).isEmpty());
+    }
+
+    private Set<String> gcInternal(long maxBlobGcInSecs) throws Exception {
         String repoId = null;
         if (SharedDataStoreUtils.isShared(store.getBlobStore())) {
             repoId = ClusterRepositoryInfo.createId(nodeStore);
@@ -186,18 +213,42 @@ public class SegmentDataStoreBlobGCTest {
                 REPOSITORY.getNameFromId(repoId));
         }
 
+        ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(10);
         MarkSweepGarbageCollector gc = new MarkSweepGarbageCollector(
                 new SegmentBlobReferenceRetriever(store.getTracker()),
-                    (GarbageCollectableBlobStore) store.getBlobStore(),
-                    MoreExecutors.sameThreadExecutor(),
-                    "./target", 2048, 0, repoId);
+                    (GarbageCollectableBlobStore) store.getBlobStore(), executor, "./target", 2048, maxBlobGcInSecs,
+                                                                        repoId);
         gc.collectGarbage(false);
 
+        assertEquals(0, executor.getTaskCount());
         Set<String> existingAfterGC = iterate();
-        log.info("{} blobs that should have remained after gc : {}", remaining.size(), remaining);
         log.info("{} blobs existing after gc : {}", existingAfterGC.size(), existingAfterGC);
+        return existingAfterGC;
+    }
 
-        assertTrue(Sets.symmetricDifference(remaining, existingAfterGC).isEmpty());
+    @Test
+    public void gcLongRunningBlobCollection() throws Exception {
+        DataStoreState state = setUp();
+        log.info("{} Blobs added {}", state.blobsAdded.size(), state.blobsAdded);
+        log.info("{} Blobs should be present {}", state.blobsPresent.size(), state.blobsPresent);
+
+        ThreadPoolExecutor executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(10);
+        String repoId = null;
+        if (SharedDataStoreUtils.isShared(store.getBlobStore())) {
+            repoId = ClusterRepositoryInfo.createId(nodeStore);
+            ((SharedDataStore) store.getBlobStore()).addMetadataRecord(
+                new ByteArrayInputStream(new byte[0]),
+                REPOSITORY.getNameFromId(repoId));
+        }
+        TestGarbageCollector gc = new TestGarbageCollector(
+            new SegmentBlobReferenceRetriever(store.getTracker()),
+            (GarbageCollectableBlobStore) store.getBlobStore(), executor, "./target", 5, 5000, repoId);
+        gc.collectGarbage(false);
+        Set<String> existingAfterGC = iterate();
+        log.info("{} Blobs existing after gc {}", existingAfterGC.size(), existingAfterGC);
+
+        assertTrue(Sets.difference(state.blobsPresent, existingAfterGC).isEmpty());
+        assertEquals(gc.additionalBlobs, Sets.symmetricDifference(state.blobsPresent, existingAfterGC));
     }
 
     protected Set<String> iterate() throws Exception {
@@ -225,6 +276,82 @@ public class SegmentDataStoreBlobGCTest {
         byte[] data = new byte[size];
         r.nextBytes(data);
         return new ByteArrayInputStream(data);
+    }
+
+    /**
+    * Waits for some time and adds additional blobs after blob referenced identified to simulate
+    * long running blob id collection phase.
+     */
+    class TestGarbageCollector extends MarkSweepGarbageCollector {
+        long maxLastModifiedInterval;
+        String root;
+        GarbageCollectableBlobStore blobStore;
+        Set<String> additionalBlobs;
+
+        public TestGarbageCollector(BlobReferenceRetriever marker, GarbageCollectableBlobStore blobStore,
+                                    Executor executor, String root, int batchCount, long maxLastModifiedInterval,
+                                    @Nullable String repositoryId) throws IOException {
+            super(marker, blobStore, executor, root, batchCount, maxLastModifiedInterval, repositoryId);
+            this.root = root;
+            this.blobStore = blobStore;
+            this.maxLastModifiedInterval = maxLastModifiedInterval;
+            this.additionalBlobs = Sets.newHashSet();
+        }
+
+        @Override
+        protected void markAndSweep(boolean markOnly) throws Exception {
+            boolean threw = true;
+            GarbageCollectorFileState fs = new GarbageCollectorFileState(root);
+            try {
+                Stopwatch sw = Stopwatch.createStarted();
+                LOG.info("Starting Test Blob garbage collection");
+
+                // Sleep a little more than the max interval to get over the interval for valid blobs
+                Thread.sleep(maxLastModifiedInterval + 100);
+                LOG.info("Slept {} to make blobs old", maxLastModifiedInterval + 100);
+
+                long markStart = System.currentTimeMillis();
+                mark(fs);
+                LOG.info("Mark finished");
+
+                additionalBlobs = createAdditional();
+
+                if (!markOnly) {
+                    Thread.sleep(maxLastModifiedInterval + 100);
+                    LOG.info("Slept {} to make additional blobs old", maxLastModifiedInterval + 100);
+
+                    long deleteCount = sweep(fs, markStart);
+                    threw = false;
+
+                    LOG.info("Blob garbage collection completed in {}. Number of blobs deleted [{}]", sw.toString(),
+                        deleteCount, maxLastModifiedInterval);
+                }
+            } finally {
+                if (!LOG.isTraceEnabled()) {
+                    Closeables.close(fs, threw);
+                }
+            }
+        }
+
+        public HashSet<String> createAdditional() throws Exception {
+            HashSet<String> blobSet = new HashSet<String>();
+            NodeBuilder a = nodeStore.getRoot().builder();
+            int number = 5;
+            for (int i = 0; i < number; i++) {
+                SegmentBlob b = (SegmentBlob) nodeStore.createBlob(randomStream(100 + i, 16516));
+                a.child("cafter" + i).setProperty("x", b);
+                Iterator<String> idIter =
+                    ((GarbageCollectableBlobStore) blobStore).resolveChunks(b.getBlobId());
+                while (idIter.hasNext()) {
+                    String chunk = idIter.next();
+                    blobSet.add(chunk);
+                }
+            }
+            log.info("{} Additional created {}", blobSet.size(), blobSet);
+
+            nodeStore.merge(a, EmptyHook.INSTANCE, CommitInfo.EMPTY);
+            return blobSet;
+        }
     }
 }
 

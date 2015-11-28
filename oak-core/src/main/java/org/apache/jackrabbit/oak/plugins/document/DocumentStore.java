@@ -23,6 +23,7 @@ import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
 
 import org.apache.jackrabbit.oak.cache.CacheStats;
+import org.apache.jackrabbit.oak.plugins.document.UpdateOp.Condition;
 import org.apache.jackrabbit.oak.plugins.document.cache.CacheInvalidationStats;
 
 /**
@@ -165,7 +166,7 @@ public interface DocumentStore {
                                      Map<String, Map<UpdateOp.Key, UpdateOp.Condition>> toRemove);
 
     /**
-     * Try to create a list of documents. This method returns {@code code} iff
+     * Try to create a list of documents. This method returns {@code true} iff
      * none of the documents existed before and the create was successful. This
      * method will return {@code false} if one of the documents already exists
      * in the store. Some documents may still have been created in the store.
@@ -178,8 +179,9 @@ public interface DocumentStore {
      *
      * @param <T> the document type
      * @param collection the collection
-     * @param updateOps the list of documents to add
+     * @param updateOps the list of documents to add (where {@link Condition}s are not allowed)
      * @return true if this worked (if none of the documents already existed)
+     * @throws IllegalArgumentException when at least one of the {@linkplain UpdateOp}s is conditional
      */
     <T extends Document> boolean create(Collection<T> collection, List<UpdateOp> updateOps);
 
@@ -193,7 +195,9 @@ public interface DocumentStore {
      * @param <T> the document type.
      * @param collection the collection.
      * @param keys the keys of the documents to update.
-     * @param updateOp the update operation to apply to each of the documents.
+     * @param updateOp the update operation to apply to each of the documents
+     *        (where {@link Condition}s are not allowed)
+     * @throws IllegalArgumentException when the {@linkplain UpdateOp} is conditional
      */
     <T extends Document> void update(Collection<T> collection,
                                      List<String> keys,
@@ -205,8 +209,9 @@ public interface DocumentStore {
      *
      * @param <T> the document type
      * @param collection the collection
-     * @param update the update operation
+     * @param update the update operation (where {@link Condition}s are not allowed)
      * @return the old document or <code>null</code> if it didn't exist before.
+     * @throws IllegalArgumentException when the {@linkplain UpdateOp} is conditional
      */
     @CheckForNull
     <T extends Document> T createOrUpdate(Collection<T> collection, UpdateOp update);
@@ -231,6 +236,13 @@ public interface DocumentStore {
      */
     @CheckForNull
     CacheInvalidationStats invalidateCache();
+
+    /**
+     * Invalidate the document cache but only with entries that match one
+     * of the keys provided.
+     */
+    @CheckForNull
+    CacheInvalidationStats invalidateCache(Iterable<String> keys);
 
     /**
      * Invalidate the document cache for the given key.
@@ -274,4 +286,15 @@ public interface DocumentStore {
      * @return description of the underlying storage.
      */
     Map<String, String> getMetadata();
+    
+    /**
+     * @return the estimated time difference in milliseconds between
+     * the local instance and the (typically common, shared) document server system.
+     * The value can be zero if the times are estimated to be equal,
+     * positive when the local instance is ahead of the remote server
+     * and negative when the local instance is behind the remote server. An invocation is not cached
+     * and typically requires a round-trip to the server (but that is not a requirement).
+     * @throws UnsupportedOperationException if this DocumentStore does not support this method
+     */
+    long determineServerTimeDifferenceMillis();
 }

@@ -34,6 +34,7 @@ import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import com.google.common.base.Function;
 import com.google.common.base.Predicate;
 import com.google.common.collect.AbstractIterator;
 import com.mongodb.BasicDBObject;
@@ -51,6 +52,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.collect.Iterables.transform;
 import static org.apache.jackrabbit.oak.plugins.document.NodeDocument.isDeletedEntry;
 
 /**
@@ -135,11 +137,11 @@ public class Utils {
             if (e.getKey() instanceof Revision) {
                 size += 32;
             } else {
-                size += 48 + e.getKey().toString().length() * 2;
+                size += estimateMemoryUsage(e.getKey().toString());
             }
             Object o = e.getValue();
             if (o instanceof String) {
-                size += 48 + ((String) o).length() * 2;
+                size += estimateMemoryUsage((String) o);
             } else if (o instanceof Long) {
                 size += 16;
             } else if (o instanceof Boolean) {
@@ -167,6 +169,16 @@ public class Utils {
             size += map.size() * 64;
         }
         return size;
+    }
+
+    /**
+     * Estimates the memory usage of the given string.
+     *
+     * @param s the string to estimate.
+     * @return the estimated memory usage.
+     */
+    public static int estimateMemoryUsage(String s) {
+        return 48 + s.length() * 2;
     }
 
     /**
@@ -498,12 +510,30 @@ public class Utils {
      */
     @CheckForNull
     public static Revision max(@Nullable Revision a, @Nullable Revision b) {
+        return max(a, b, StableRevisionComparator.INSTANCE);
+    }
+
+    /**
+     * Returns the revision which is considered more recent or {@code null} if
+     * both revisions are {@code null}. The implementation will return the first
+     * revision if both are considered equal. The comparison is done using the
+     * provided comparator.
+     *
+     * @param a the first revision (or {@code null}).
+     * @param b the second revision (or {@code null}).
+     * @param c the comparator.
+     * @return the revision considered more recent.
+     */
+    @CheckForNull
+    public static Revision max(@Nullable Revision a,
+                               @Nullable Revision b,
+                               @Nonnull Comparator<Revision> c) {
         if (a == null) {
             return b;
         } else if (b == null) {
             return a;
         }
-        return StableRevisionComparator.INSTANCE.compare(a, b) >= 0 ? a : b;
+        return c.compare(a, b) >= 0 ? a : b;
     }
 
     /**
@@ -588,5 +618,54 @@ public class Utils {
      */
     public static boolean isHiddenPath(@Nonnull String path) {
         return path.contains("/:");
+    }
+
+    /**
+     * Transforms the given {@link Iterable} from {@link String} to
+     * {@link StringValue} elements. The {@link Iterable} must no have
+     * {@code null} values.
+     */
+    public static Iterable<StringValue> asStringValueIterable(
+            @Nonnull Iterable<String> values) {
+        return transform(values, new Function<String, StringValue>() {
+            @Override
+            public StringValue apply(String input) {
+                return new StringValue(input);
+            }
+        });
+    }
+
+    /**
+     * Transforms the given paths into ids using {@link #getIdFromPath(String)}.
+     */
+    public static Iterable<String> pathToId(@Nonnull Iterable<String> paths) {
+        return transform(paths, new Function<String, String>() {
+            @Override
+            public String apply(String input) {
+                return getIdFromPath(input);
+            }
+        });
+    }
+
+    /**
+     * Returns the highest timestamp of all the passed external revisions.
+     * A revision is considered external if the clusterId is different from the
+     * passed {@code localClusterId}.
+     *
+     * @param revisions the revisions to consider.
+     * @param localClusterId the id of the local cluster node.
+     * @return the highest timestamp or {@link Long#MIN_VALUE} if none of the
+     *          revisions is external.
+     */
+    public static long getMaxExternalTimestamp(Iterable<Revision> revisions,
+                                               int localClusterId) {
+        long maxTime = Long.MIN_VALUE;
+        for (Revision r : revisions) {
+            if (r.getClusterId() == localClusterId) {
+                continue;
+            }
+            maxTime = Math.max(maxTime, r.getTimestamp());
+        }
+        return maxTime;
     }
 }

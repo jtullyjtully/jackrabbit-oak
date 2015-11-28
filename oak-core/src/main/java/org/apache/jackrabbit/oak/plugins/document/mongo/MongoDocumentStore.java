@@ -21,7 +21,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
+import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +30,7 @@ import java.util.TreeMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.regex.Matcher;
@@ -43,6 +44,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.UncheckedExecutionException;
 import com.mongodb.MongoClientURI;
+import com.mongodb.MongoExecutionTimeoutException;
 import com.mongodb.QueryOperators;
 import com.mongodb.ReadPreference;
 
@@ -54,6 +56,7 @@ import org.apache.jackrabbit.oak.plugins.document.Document;
 import org.apache.jackrabbit.oak.plugins.document.DocumentMK;
 import org.apache.jackrabbit.oak.plugins.document.DocumentStore;
 import org.apache.jackrabbit.oak.plugins.document.DocumentStoreException;
+import org.apache.jackrabbit.oak.plugins.document.JournalEntry;
 import org.apache.jackrabbit.oak.plugins.document.NodeDocument;
 import org.apache.jackrabbit.oak.plugins.document.Revision;
 import org.apache.jackrabbit.oak.plugins.document.StableRevisionComparator;
@@ -66,6 +69,7 @@ import org.apache.jackrabbit.oak.plugins.document.cache.CacheInvalidationStats;
 import org.apache.jackrabbit.oak.plugins.document.cache.ForwardingListener;
 import org.apache.jackrabbit.oak.plugins.document.cache.NodeDocOffHeapCache;
 import org.apache.jackrabbit.oak.plugins.document.cache.OffHeapCache;
+import org.apache.jackrabbit.oak.plugins.document.mongo.CacheInvalidator.InvalidationResult;
 import org.apache.jackrabbit.oak.plugins.document.util.StringValue;
 import org.apache.jackrabbit.oak.plugins.document.util.Utils;
 import org.apache.jackrabbit.oak.stats.Clock;
@@ -116,8 +120,11 @@ public class MongoDocumentStore implements DocumentStore {
     private final DBCollection nodes;
     private final DBCollection clusterNodes;
     private final DBCollection settings;
+    private final DBCollection journal;
 
-    private final Cache<CacheValue, NodeDocument> nodesCache;
+	private final DB db;
+
+	private final Cache<CacheValue, NodeDocument> nodesCache;
     private final CacheStats cacheStats;
 
     /**
@@ -136,10 +143,9 @@ public class MongoDocumentStore implements DocumentStore {
     private final Striped<ReadWriteLock> parentLocks = Striped.readWriteLock(64);
 
     /**
-     * Comparator for maps with {@link Revision} keys. The maps are ordered
-     * descending, newest revisions first!
+     * Counts how many times {@link TreeLock}s were acquired.
      */
-    private final Comparator<Revision> comparator = StableRevisionComparator.REVERSE;
+    private final AtomicLong lockAcquisitionCounter = new AtomicLong();
 
     private Clock clock = Clock.SIMPLE;
 
@@ -173,6 +179,17 @@ public class MongoDocumentStore implements DocumentStore {
     private final long maxQueryTimeMS =
             Long.getLong("oak.mongo.maxQueryTimeMS", TimeUnit.MINUTES.toMillis(1));
 
+    /**
+     * Duration in milliseconds after a mongo query with an additional
+     * constraint (e.g. _modified) on the NODES collection times out and is
+     * executed again without holding a {@link TreeLock} and without updating
+     * the cache with data retrieved from MongoDB.
+     * <p>
+     * Default is 3000 (three seconds).
+     */
+    private long maxLockedQueryTimeMS =
+            Long.getLong("oak.mongo.maxLockedQueryTimeMS", TimeUnit.SECONDS.toMillis(3));
+
     private String lastReadWriteMode;
 
     private final Map<String, String> metadata;
@@ -184,12 +201,11 @@ public class MongoDocumentStore implements DocumentStore {
                 .put("version", version)
                 .build();
 
-        nodes = db.getCollection(
-                Collection.NODES.toString());
-        clusterNodes = db.getCollection(
-                Collection.CLUSTER_NODES.toString());
-        settings = db.getCollection(
-                Collection.SETTINGS.toString());
+        this.db = db;
+        nodes = db.getCollection(Collection.NODES.toString());
+        clusterNodes = db.getCollection(Collection.CLUSTER_NODES.toString());
+        settings = db.getCollection(Collection.SETTINGS.toString());
+        journal = db.getCollection(Collection.JOURNAL.toString());
 
         maxReplicationLagMillis = builder.getMaxReplicationLagMillis();
 
@@ -224,6 +240,11 @@ public class MongoDocumentStore implements DocumentStore {
         options.put("sparse", Boolean.TRUE);
         this.nodes.ensureIndex(index, options);
 
+        index = new BasicDBObject();
+        index.put(JournalEntry.MODIFIED, 1);
+        options = new BasicDBObject();
+        options.put("unique", Boolean.FALSE);
+        this.journal.ensureIndex(index, options);
 
         // TODO expire entries if the parent was changed
         if (builder.useOffHeapCache()) {
@@ -286,6 +307,59 @@ public class MongoDocumentStore implements DocumentStore {
         //TODO Check if we should use LinearInvalidator for small cache sizes as
         //that would lead to lesser number of queries
         return CacheInvalidator.createHierarchicalInvalidator(this).invalidateCache();
+    }
+    
+    @Override
+    public CacheInvalidationStats invalidateCache(Iterable<String> keys) {
+        LOG.debug("invalidateCache: start");
+        final InvalidationResult result = new InvalidationResult();
+        int size  = 0;
+
+        final Iterator<String> it = keys.iterator();
+        while(it.hasNext()) {
+            // read chunks of documents only
+            final List<String> ids = new ArrayList<String>(IN_CLAUSE_BATCH_SIZE);
+            while(it.hasNext() && ids.size() < IN_CLAUSE_BATCH_SIZE) {
+                final String id = it.next();
+                if (getCachedNodeDoc(id) != null) {
+                    // only add those that we actually do have cached
+                    ids.add(id);
+                }
+            }
+            size += ids.size();
+            if (LOG.isTraceEnabled()) {
+                LOG.trace("invalidateCache: batch size: {} of total so far {}",
+                        ids.size(), size);
+            }
+            
+            QueryBuilder query = QueryBuilder.start(Document.ID).in(ids);
+            // Fetch only the modCount and id
+            final BasicDBObject fields = new BasicDBObject(Document.ID, 1);
+            fields.put(Document.MOD_COUNT, 1);
+            
+            DBCursor cursor = nodes.find(query.get(), fields);
+            cursor.setReadPreference(ReadPreference.primary());
+            result.queryCount++;
+            
+            for (DBObject obj : cursor) {
+                result.cacheEntriesProcessedCount++;
+                String id = (String) obj.get(Document.ID);
+                Number modCount = (Number) obj.get(Document.MOD_COUNT);
+                
+                CachedNodeDocument cachedDoc = getCachedNodeDoc(id);
+                if (cachedDoc != null
+                        && !Objects.equal(cachedDoc.getModCount(), modCount)) {
+                    invalidateCache(Collection.NODES, id);
+                    result.invalidationCount++;
+                } else {
+                    result.upToDateCount++;
+                }
+            }
+        }
+
+        result.cacheSize = size;
+        LOG.trace("invalidateCache: end. total: {}", size);
+        return result;
     }
 
     @Override
@@ -353,31 +427,30 @@ public class MongoDocumentStore implements DocumentStore {
         try {
             TreeLock lock = acquire(key);
             try {
-                if (maxCacheAge == 0) {
-                    invalidateCache(collection, key);
-                }
-                while (true) {
-                    doc = nodesCache.get(cacheKey, new Callable<NodeDocument>() {
-                        @Override
-                        public NodeDocument call() throws Exception {
-                            NodeDocument doc = (NodeDocument) findUncachedWithRetry(
-                                    collection, key,
-                                    getReadPreference(maxCacheAge), 2);
-                            if (doc == null) {
-                                doc = NodeDocument.NULL;
+                if (maxCacheAge > 0 || preferCached) {
+                    // try again some other thread may have populated
+                    // the cache by now
+                    doc = nodesCache.getIfPresent(cacheKey);
+                    if (doc != null) {
+                        if (preferCached ||
+                                getTime() - doc.getCreated() < maxCacheAge) {
+                            if (doc == NodeDocument.NULL) {
+                                return null;
                             }
-                            return doc;
+                            return (T) doc;
                         }
-                    });
-                    if (maxCacheAge == 0 || preferCached) {
-                        break;
                     }
-                    if (getTime() - doc.getCreated() < maxCacheAge) {
-                        break;
-                    }
-                    // too old: invalidate, try again
-                    invalidateCache(collection, key);
                 }
+                final NodeDocument d = (NodeDocument) findUncachedWithRetry(
+                        collection, key,
+                        getReadPreference(maxCacheAge), 2);
+                invalidateCache(collection, key);
+                doc = nodesCache.get(cacheKey, new Callable<NodeDocument>() {
+                    @Override
+                    public NodeDocument call() throws Exception {
+                        return d == null ? NodeDocument.NULL : d;
+                    }
+                });
             } finally {
                 lock.unlock();
             }
@@ -390,6 +463,8 @@ public class MongoDocumentStore implements DocumentStore {
             t = e.getCause();
         } catch (ExecutionException e) {
             t = e.getCause();
+        } catch (RuntimeException e) {
+            t = e;
         }
         throw new DocumentStoreException("Failed to load document with " + key, t);
     }
@@ -411,6 +486,9 @@ public class MongoDocumentStore implements DocumentStore {
             DocumentReadPreference docReadPref,
             int retries) {
         checkArgument(retries >= 0, "retries must not be negative");
+        if (key.equals("0:/")) {
+            LOG.trace("root node");
+        }
         int numAttempts = retries + 1;
         MongoException ex = null;
         for (int i = 0; i < numAttempts; i++) {
@@ -489,6 +567,36 @@ public class MongoDocumentStore implements DocumentStore {
                                               String indexedProperty,
                                               long startValue,
                                               int limit) {
+        boolean withLock = true;
+        if (collection == Collection.NODES && indexedProperty != null) {
+            long maxQueryTime;
+            if (maxQueryTimeMS > 0) {
+                maxQueryTime = Math.min(maxQueryTimeMS, maxLockedQueryTimeMS);
+            } else {
+                maxQueryTime = maxLockedQueryTimeMS;
+            }
+            try {
+                return queryInternal(collection, fromKey, toKey, indexedProperty,
+                        startValue, limit, maxQueryTime, true);
+            } catch (MongoExecutionTimeoutException e) {
+                LOG.info("query timed out after {} milliseconds and will be retried without lock {}",
+                        maxQueryTime, Lists.newArrayList(fromKey, toKey, indexedProperty, startValue, limit));
+                withLock = false;
+            }
+        }
+        return queryInternal(collection, fromKey, toKey, indexedProperty,
+                startValue, limit, maxQueryTimeMS, withLock);
+    }
+
+    @Nonnull
+    <T extends Document> List<T> queryInternal(Collection<T> collection,
+                                                       String fromKey,
+                                                       String toKey,
+                                                       String indexedProperty,
+                                                       long startValue,
+                                                       int limit,
+                                                       long maxQueryTime,
+                                                       boolean withLock) {
         log("query", fromKey, toKey, indexedProperty, startValue, limit);
         DBCollection dbCollection = getDBCollection(collection);
         QueryBuilder queryBuilder = QueryBuilder.start(Document.ID);
@@ -518,16 +626,20 @@ public class MongoDocumentStore implements DocumentStore {
         }
         DBObject query = queryBuilder.get();
         String parentId = Utils.getParentIdFromLowerLimit(fromKey);
-        TreeLock lock = acquireExclusive(parentId != null ? parentId : "");
+        long lockTime = -1;
         final long start = PERFLOG.start();
+        TreeLock lock = withLock ? acquireExclusive(parentId != null ? parentId : "") : null;
         try {
+            if (start != -1) {
+                lockTime = System.currentTimeMillis() - start;
+            }
             DBCursor cursor = dbCollection.find(query).sort(BY_ID_ASC);
             if (!disableIndexHint) {
                 cursor.hint(hint);
             }
-            if (maxQueryTimeMS > 0) {
+            if (maxQueryTime > 0) {
                 // OAK-2614: set maxTime if maxQueryTimeMS > 0
-                cursor.maxTime(maxQueryTimeMS, TimeUnit.MILLISECONDS);
+                cursor.maxTime(maxQueryTime, TimeUnit.MILLISECONDS);
             }
             ReadPreference readPreference =
                     getMongoReadPreference(collection, parentId, getDefaultReadPreference(collection));
@@ -544,7 +656,9 @@ public class MongoDocumentStore implements DocumentStore {
                 for (int i = 0; i < limit && cursor.hasNext(); i++) {
                     DBObject o = cursor.next();
                     T doc = convertFromDBObject(collection, o);
-                    if (collection == Collection.NODES && doc != null) {
+                    if (collection == Collection.NODES
+                            && doc != null
+                            && lock != null) {
                         doc.seal();
                         String id = doc.getId();
                         CacheValue cacheKey = new StringValue(id);
@@ -573,8 +687,10 @@ public class MongoDocumentStore implements DocumentStore {
             }
             return list;
         } finally {
-            lock.unlock();
-            PERFLOG.end(start, 1, "query for children from [{}] to [{}]", fromKey, toKey);
+            if (lock != null) {
+                lock.unlock();
+            }
+            PERFLOG.end(start, 1, "query for children from [{}] to [{}], lock:{}", fromKey, toKey, lockTime);
         }
     }
 
@@ -690,16 +806,11 @@ public class MongoDocumentStore implements DocumentStore {
                 QueryBuilder query = createQueryForUpdate(updateOp.getId(),
                         updateOp.getConditions());
                 query.and(Document.MOD_COUNT).is(modCount);
-                DBObject fields = new BasicDBObject();
-                // return _id only
-                fields.put("_id", 1);
 
-                DBObject oldNode = dbCollection.findAndModify(query.get(), fields,
-                        null /*sort*/, false /*remove*/, update, false /*returnNew*/,
-                        false /*upsert*/);
-                if (oldNode != null) {
+                WriteResult result = dbCollection.update(query.get(), update);
+                if (result.getN() > 0) {
                     // success, update cached document
-                    applyToCache(collection, cachedDoc, updateOp);
+                    putToCache(collection, cachedDoc, updateOp);
                     // return previously cached document
                     return cachedDoc;
                 }
@@ -713,9 +824,18 @@ public class MongoDocumentStore implements DocumentStore {
                 return null;
             }
             T oldDoc = convertFromDBObject(collection, oldNode);
-            applyToCache(collection, oldDoc, updateOp);
             if (oldDoc != null) {
+                putToCache(collection, oldDoc, updateOp);
                 oldDoc.seal();
+            } else if (upsert) {
+                if (collection == Collection.NODES) {
+                    NodeDocument doc = (NodeDocument) collection.newDocument(this);
+                    UpdateUtils.applyChanges(doc, updateOp);
+                    addToCache(doc);
+                }
+            } else {
+                // updateOp without conditions and not an upsert
+                // this means the document does not exist
             }
             return oldDoc;
         } catch (Exception e) {
@@ -731,6 +851,7 @@ public class MongoDocumentStore implements DocumentStore {
     public <T extends Document> T createOrUpdate(Collection<T> collection, UpdateOp update)
             throws DocumentStoreException {
         log("createOrUpdate", update);
+        UpdateUtils.assertUnconditional(update);
         T doc = findAndModify(collection, update, true, false);
         log("createOrUpdate returns ", doc);
         return doc;
@@ -754,8 +875,9 @@ public class MongoDocumentStore implements DocumentStore {
         for (int i = 0; i < updateOps.size(); i++) {
             inserts[i] = new BasicDBObject();
             UpdateOp update = updateOps.get(i);
+            UpdateUtils.assertUnconditional(update);
             T target = collection.newDocument(this);
-            UpdateUtils.applyChanges(target, update, comparator);
+            UpdateUtils.applyChanges(target, update);
             docs.add(target);
             for (Entry<Key, Operation> entry : update.getChanges().entrySet()) {
                 Key k = entry.getKey();
@@ -773,8 +895,19 @@ public class MongoDocumentStore implements DocumentStore {
                             throw new IllegalStateException(
                                     "SET_MAP_ENTRY must not have null revision");
                         }
-                        DBObject value = new RevisionEntry(r, op.value);
-                        inserts[i].put(k.getName(), value);
+                        DBObject value = (DBObject) inserts[i].get(k.getName());
+                        if (value == null) {
+                            value = new RevisionEntry(r, op.value);
+                            inserts[i].put(k.getName(), value);
+                        } else if (value.keySet().size() == 1) {
+                            String key = value.keySet().iterator().next();
+                            Object val = value.get(key);
+                            value = new BasicDBObject(key, val);
+                            value.put(r.toString(), op.value);
+                            inserts[i].put(k.getName(), value);
+                        } else {
+                            value.put(r.toString(), op.value);
+                        }
                         break;
                     }
                     case REMOVE_MAP_ENTRY:
@@ -820,6 +953,7 @@ public class MongoDocumentStore implements DocumentStore {
                                             List<String> keys,
                                             UpdateOp updateOp) {
         log("update", keys, updateOp);
+        UpdateUtils.assertUnconditional(updateOp);
         DBCollection dbCollection = getDBCollection(collection);
         QueryBuilder query = QueryBuilder.start(Document.ID).in(keys);
         // make sure we don't modify the original updateOp
@@ -849,8 +983,7 @@ public class MongoDocumentStore implements DocumentStore {
                                 // make sure concurrently loaded document is invalidated
                                 nodesCache.invalidate(new StringValue(entry.getKey()));
                             } else {
-                                applyToCache(Collection.NODES, entry.getValue(),
-                                        updateOp.shallowCopy(entry.getKey()));
+                                updateCache(Collection.NODES, entry.getValue(), updateOp.shallowCopy(entry.getKey()));
                             }
                         } finally {
                             lock.unlock();
@@ -954,7 +1087,7 @@ public class MongoDocumentStore implements DocumentStore {
 
     @Nonnull
     private Map<Revision, Object> convertMongoMap(@Nonnull BasicDBObject obj) {
-        Map<Revision, Object> map = new TreeMap<Revision, Object>(comparator);
+        Map<Revision, Object> map = new TreeMap<Revision, Object>(StableRevisionComparator.REVERSE);
         for (Map.Entry<String, Object> entry : obj.entrySet()) {
             map.put(Revision.fromString(entry.getKey()), entry.getValue());
         }
@@ -968,7 +1101,9 @@ public class MongoDocumentStore implements DocumentStore {
             return clusterNodes;
         } else if (collection == Collection.SETTINGS) {
             return settings;
-        }else {
+        } else if (collection == Collection.JOURNAL) {
+            return journal;
+        } else {
             throw new IllegalArgumentException(
                     "Unknown collection: " + collection.toString());
         }
@@ -1026,6 +1161,10 @@ public class MongoDocumentStore implements DocumentStore {
         return nodesCache.getIfPresent(new StringValue(id));
     }
 
+    protected Cache<CacheValue, NodeDocument> getNodeDocumentCache() {
+        return nodesCache;
+    }
+
     private static void log(String message, Object... args) {
         if (LOG.isDebugEnabled()) {
             String argList = Arrays.toString(args);
@@ -1053,43 +1192,34 @@ public class MongoDocumentStore implements DocumentStore {
      *
      * @param <T> the document type.
      * @param collection the document collection.
-     * @param oldDoc the old document or <code>null</code> if the update is for
-     *               a new document (insert).
+     * @param oldDoc the old document.
      * @param updateOp the update operation.
      */
-    private <T extends Document> void applyToCache(@Nonnull Collection<T> collection,
-                                                   @Nullable T oldDoc,
-                                                   @Nonnull UpdateOp updateOp) {
+    private <T extends Document> void updateCache(@Nonnull Collection<T> collection,
+                                                  @Nonnull T oldDoc,
+                                                  @Nonnull UpdateOp updateOp) {
         // cache the new document
         if (collection == Collection.NODES) {
+            checkNotNull(oldDoc);
+            checkNotNull(updateOp);
+            // we can only update the cache based on the oldDoc if we
+            // still have the oldDoc in the cache, otherwise we may
+            // update the cache with an outdated document
             CacheValue key = new StringValue(updateOp.getId());
-            NodeDocument newDoc = (NodeDocument) collection.newDocument(this);
-            if (oldDoc != null) {
-                // we can only update the cache based on the oldDoc if we
-                // still have the oldDoc in the cache, otherwise we may
-                // update the cache with an outdated document
-                NodeDocument cached = nodesCache.getIfPresent(key);
-                if (cached == null) {
-                    // cannot use oldDoc to update cache
-                    return;
-                }
-                oldDoc.deepCopy(newDoc);
+            NodeDocument cached = nodesCache.getIfPresent(key);
+            if (cached == null) {
+                // cannot use oldDoc to update cache
+                return;
             }
-            UpdateUtils.applyChanges(newDoc, updateOp, comparator);
-            newDoc.seal();
 
-            NodeDocument cached = addToCache(newDoc);
-            if (cached == newDoc) {
-                // successful
-                return;
-            }
-            if (oldDoc == null) {
-                // this is an insert and some other thread was quicker
-                // loading it into the cache -> return now
-                return;
-            }
-            // this is an update (oldDoc != null)
+            // check if the currently cached document matches oldDoc
             if (Objects.equal(cached.getModCount(), oldDoc.getModCount())) {
+                NodeDocument newDoc = (NodeDocument) collection.newDocument(this);
+                oldDoc.deepCopy(newDoc);
+
+                UpdateUtils.applyChanges(newDoc, updateOp);
+                newDoc.seal();
+
                 nodesCache.put(key, newDoc);
             } else {
                 // the cache entry was modified by some other thread in
@@ -1145,6 +1275,30 @@ public class MongoDocumentStore implements DocumentStore {
         }
     }
 
+    /**
+     * Unconditionally puts a document into the cache if {@code collection} is
+     * {@link Collection#NODES}. The document put into the cache is
+     * {@code oldDoc} with the {@code updateOp} applied. This method does not
+     * acquire a lock from {@link #locks}! The caller must ensure a lock is held
+     * for the given document.
+     *
+     * @param collection the collection where oldDoc belongs to.
+     * @param oldDoc how the document looked before the update.
+     * @param updateOp the update just applied to the document.
+     */
+    private <T extends Document> void putToCache(@Nonnull Collection<T> collection,
+                                                 @Nonnull T oldDoc,
+                                                 @Nonnull UpdateOp updateOp) {
+        if (collection == Collection.NODES) {
+            CacheValue key = new StringValue(oldDoc.getId());
+            NodeDocument newDoc = (NodeDocument) collection.newDocument(this);
+            oldDoc.deepCopy(newDoc);
+            UpdateUtils.applyChanges(newDoc, updateOp);
+            newDoc.seal();
+            nodesCache.put(key, newDoc);
+        }
+    }
+
     @Nonnull
     private static QueryBuilder createQueryForUpdate(String key,
                                                      Map<Key, Condition> conditions) {
@@ -1159,6 +1313,9 @@ public class MongoDocumentStore implements DocumentStore {
                     break;
                 case EQUALS:
                     query.and(k.toString()).is(c.value);
+                    break;
+                case NOTEQUALS:
+                    query.and(k.toString()).notEquals(c.value);
                     break;
             }
         }
@@ -1252,6 +1409,7 @@ public class MongoDocumentStore implements DocumentStore {
      * @return the acquired lock for the given key.
      */
     private TreeLock acquire(String key) {
+        lockAcquisitionCounter.incrementAndGet();
         return TreeLock.shared(parentLocks.get(getParentId(key)), locks.get(key));
     }
 
@@ -1263,6 +1421,7 @@ public class MongoDocumentStore implements DocumentStore {
      * @return the acquired lock for the given parent key.
      */
     private TreeLock acquireExclusive(String parentKey) {
+        lockAcquisitionCounter.incrementAndGet();
         return TreeLock.exclusive(parentLocks.get(parentKey));
     }
 
@@ -1303,6 +1462,14 @@ public class MongoDocumentStore implements DocumentStore {
         this.clock = clock;
     }
 
+    void setMaxLockedQueryTimeMS(long maxLockedQueryTimeMS) {
+        this.maxLockedQueryTimeMS = maxLockedQueryTimeMS;
+    }
+
+    long getLockAcquisitionCount() {
+        return lockAcquisitionCounter.get();
+    }
+
     private final static class TreeLock {
 
         private final Lock parentLock;
@@ -1335,5 +1502,35 @@ public class MongoDocumentStore implements DocumentStore {
             }
             parentLock.unlock();
         }
+    }
+
+    @Override
+    public long determineServerTimeDifferenceMillis() {
+        // the assumption is that the network delay from this instance
+        // to the server, and from the server back to this instance
+        // are (more or less) equal.
+        // taking this assumption into account allows to remove
+        // the network delays from the picture: the difference
+        // between end and start time is exactly this network
+        // delay (plus some server time, but that's neglected).
+        // so if the clocks are in perfect sync and the above
+        // mentioned assumption holds, then the server time should
+        // be exactly at the midPoint between start and end.
+        // this should allow a more accurate picture of the diff.
+        final long start = System.currentTimeMillis();
+        // assumption here: server returns UTC - ie the returned
+        // date object is correctly taking care of time zones.
+        final Date serverLocalTime = db.command("serverStatus").getDate("localTime");
+        final long end = System.currentTimeMillis();
+
+        final long midPoint = (start + end) / 2;
+        final long serverLocalTimeMillis = serverLocalTime.getTime();
+
+        // the difference should be
+        // * positive when local instance is ahead
+        // * and negative when the local instance is behind
+        final long diff = midPoint - serverLocalTimeMillis;
+
+        return diff;
     }
 }

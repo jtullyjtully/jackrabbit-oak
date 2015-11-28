@@ -16,9 +16,9 @@
  */
 package org.apache.jackrabbit.oak.plugins.document;
 
-import javax.sql.DataSource;
+import java.util.List;
 
-import com.mongodb.BasicDBObject;
+import javax.sql.DataSource;
 
 import org.apache.jackrabbit.oak.plugins.document.memory.MemoryDocumentStore;
 import org.apache.jackrabbit.oak.plugins.document.mongo.MongoDocumentStore;
@@ -29,6 +29,8 @@ import org.apache.jackrabbit.oak.plugins.document.util.MongoConnection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.common.collect.Lists;
+import com.mongodb.BasicDBObject;
 import com.mongodb.DB;
 
 public abstract class DocumentStoreFixture {
@@ -36,13 +38,29 @@ public abstract class DocumentStoreFixture {
     private static final Logger LOG = LoggerFactory.getLogger(DocumentStoreFixture.class);
 
     public static final DocumentStoreFixture MEMORY = new MemoryFixture();
-    public static final DocumentStoreFixture RDB_H2 = new RDBFixture("RDB-H2(file)", "jdbc:h2:file:./target/ds-test", "sa", "");
-    public static final DocumentStoreFixture RDB_PG = new RDBFixture("RDB-Postgres", "jdbc:postgresql:oak", "postgres", "geheim");
-    public static final DocumentStoreFixture RDB_DB2 = new RDBFixture("RDB-DB2", "jdbc:db2://localhost:50000/OAK", "oak", "geheim");
-    public static final DocumentStoreFixture RDB_MYSQL = new RDBFixture("RDB-MySQL", "jdbc:mysql://localhost:3306/oak", "root", "geheim");
-    public static final DocumentStoreFixture RDB_ORACLE = new RDBFixture("RDB-Oracle", "jdbc:oracle:thin:@localhost:1521:orcl", "system", "geheim");
-    public static final DocumentStoreFixture RDB_MSSQL = new RDBFixture("RDB-MSSql", "jdbc:sqlserver://localhost:1433;databaseName=OAK", "sa", "geheim");
     public static final DocumentStoreFixture MONGO = new MongoFixture("mongodb://localhost:27017/oak");
+
+    public static final DocumentStoreFixture RDB_DB2 = new RDBFixture("RDB-DB2", System.getProperty("rdb-db2-jdbc-url",
+            "jdbc:db2://localhost:50000/OAK"), System.getProperty("rdb-db2-jdbc-user", "oak"), System.getProperty(
+            "rdb-db2-jdbc-passwd", "geheim"));
+    public static final DocumentStoreFixture RDB_DERBY = new RDBFixture("RDB-Derby(embedded)", System.getProperty(
+            "rdb-derby-jdbc-url", "jdbc:derby:./target/derby-ds-test;create=true"),
+            System.getProperty("rdb-derby-jdbc-user", "sa"), System.getProperty("rdb-derby-jdbc-passwd", ""));
+    public static final DocumentStoreFixture RDB_H2 = new RDBFixture("RDB-H2(file)", System.getProperty("rdb-h2-jdbc-url",
+            "jdbc:h2:file:./target/h2-ds-test"), System.getProperty("rdb-h2-jdbc-user", "sa"), System.getProperty(
+            "rdb-h2-jdbc-passwd", ""));
+    public static final DocumentStoreFixture RDB_MSSQL = new RDBFixture("RDB-MSSql", System.getProperty("rdb-mssql-jdbc-url",
+            "jdbc:sqlserver://localhost:1433;databaseName=OAK"), System.getProperty("rdb-mssql-jdbc-user", "sa"),
+            System.getProperty("rdb-mssql-jdbc-passwd", "geheim"));
+    public static final DocumentStoreFixture RDB_MYSQL = new RDBFixture("RDB-MySQL", System.getProperty("rdb-mysql-jdbc-url",
+            "jdbc:mysql://localhost:3306/oak"), System.getProperty("rdb-mysql-jdbc-user", "root"), System.getProperty(
+            "rdb-mysql-jdbc-passwd", "geheim"));
+    public static final DocumentStoreFixture RDB_ORACLE = new RDBFixture("RDB-Oracle", System.getProperty("rdb-oracle-jdbc-url",
+            "jdbc:oracle:thin:@localhost:1521:orcl"), System.getProperty("rdb-oracle-jdbc-user", "system"), System.getProperty(
+            "rdb-oracle-jdbc-passwd", "geheim"));
+    public static final DocumentStoreFixture RDB_PG = new RDBFixture("RDB-Postgres", System.getProperty("rdb-postgres-jdbc-url",
+            "jdbc:postgresql:oak"), System.getProperty("rdb-postgres-jdbc-user", "postgres"), System.getProperty(
+            "rdb-postgres-jdbc-passwd", "geheim"));
 
     public static final String TABLEPREFIX = "dstest_";
 
@@ -66,6 +84,10 @@ public abstract class DocumentStoreFixture {
     // return false if the multiple instances will not share the same persistence
     public boolean hasSinglePersistence() {
         return true;
+    }
+
+    public String toString() {
+        return getClass().getSimpleName() + ": "+ getName();
     }
 
     public void dispose() throws Exception {
@@ -137,23 +159,12 @@ public abstract class DocumentStoreFixture {
         public DataSource getRDBDataSource() {
             return dataSource;
         }
-
-        @Override
-        public void dispose() {
-            if (this.store1 != null) {
-                this.store1.dispose();
-                this.store1 = null;
-            }
-            if (this.store2 != null) {
-                this.store2.dispose();
-                this.store2 = null;
-            }
-        }
     }
 
     public static class MongoFixture extends DocumentStoreFixture {
         public static final String DEFAULT_URI = "mongodb://localhost:27017/oak-test";
         private String uri;
+        private List<MongoConnection> connections = Lists.newArrayList();
 
         public MongoFixture() {
             this(DEFAULT_URI);
@@ -172,6 +183,7 @@ public abstract class DocumentStoreFixture {
         public DocumentStore createDocumentStore(int clusterId) {
             try {
                 MongoConnection connection = new MongoConnection(uri);
+                connections.add(connection);
                 DB db = connection.getDB();
                 MongoUtils.dropCollections(db);
                 return new MongoDocumentStore(db, new DocumentMK.Builder().setClusterId(clusterId));
@@ -184,7 +196,11 @@ public abstract class DocumentStoreFixture {
         public boolean isAvailable() {
             try {
                 MongoConnection connection = new MongoConnection(uri);
-                connection.getDB().command(new BasicDBObject("ping", 1));
+                try {
+                    connection.getDB().command(new BasicDBObject("ping", 1));
+                } finally {
+                    connection.close();
+                }
                 return true;
             } catch (Exception e) {
                 return false;
@@ -195,9 +211,17 @@ public abstract class DocumentStoreFixture {
         public void dispose() {
             try {
                 MongoConnection connection = new MongoConnection(uri);
-                connection.getDB().dropDatabase();
+                try {
+                    connection.getDB().dropDatabase();
+                } finally {
+                    connection.close();
+                }
             } catch (Exception ignore) {
             }
+            for (MongoConnection c : connections) {
+                c.close();
+            }
+            connections.clear();
         }
     }
 }

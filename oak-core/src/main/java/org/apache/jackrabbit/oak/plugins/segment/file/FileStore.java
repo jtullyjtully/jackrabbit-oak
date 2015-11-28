@@ -434,7 +434,7 @@ public class FileStore implements SegmentStore {
         long avail = runtime.totalMemory() - runtime.freeMemory();
         long delta = 0;
         if (compactionStrategy.getCompactionMap() != null) {
-            delta = compactionStrategy.getCompactionMap().getLastMergeWeight();
+            delta = compactionStrategy.getCompactionMap().getLastWeight();
         }
         long needed = delta * compactionStrategy.getMemoryThreshold();
         if (needed >= avail) {
@@ -641,6 +641,9 @@ public class FileStore implements SegmentStore {
         gcMonitor.info("TarMK revision cleanup started. Current repository size {}",
                 humanReadableByteCount(initialSize));
 
+        newWriter();
+        tracker.clearCache();
+
         // Suggest to the JVM that now would be a good time
         // to clear stale weak references in the SegmentTracker
         System.gc();
@@ -692,7 +695,7 @@ public class FileStore implements SegmentStore {
 
         long start = System.currentTimeMillis();
         SegmentWriter writer = new SegmentWriter(this, tracker, getVersion());
-        final Compactor compactor = new Compactor(writer, compactionStrategy.cloneBinaries());
+        final Compactor compactor = new Compactor(writer, compactionStrategy.cloneBinaries(), compactionStrategy.isOfflineCompaction());
         SegmentNodeState before = getHead();
         long existing = before.getChildNode(SegmentNodeStore.CHECKPOINTS)
                 .getChildNodeCount(Long.MAX_VALUE);
@@ -902,22 +905,28 @@ public class FileStore implements SegmentStore {
                     id.getLeastSignificantBits(),
                     data, offset, length);
             if (size >= maxFileSize) {
-                writer.close();
-
-                List<TarReader> list =
-                        newArrayListWithCapacity(1 + readers.size());
-                list.add(TarReader.open(writeFile, memoryMapping));
-                list.addAll(readers);
-                readers = list;
-
-                writeNumber++;
-                writeFile = new File(
-                        directory,
-                        String.format(FILE_NAME_FORMAT, writeNumber, "a"));
-                writer = new TarWriter(writeFile);
+                newWriter();
             }
         } catch (IOException e) {
             throw new RuntimeException(e);
+        }
+    }
+
+    private void newWriter() throws IOException {
+        if (writer.isDirty()) {
+            writer.close();
+
+            List<TarReader> list =
+                    newArrayListWithCapacity(1 + readers.size());
+            list.add(TarReader.open(writeFile, memoryMapping));
+            list.addAll(readers);
+            readers = list;
+
+            writeNumber++;
+            writeFile = new File(
+                    directory,
+                    String.format(FILE_NAME_FORMAT, writeNumber, "a"));
+            writer = new TarWriter(writeFile);
         }
     }
 

@@ -13,6 +13,7 @@
  */
 package org.apache.jackrabbit.oak.query;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -25,6 +26,7 @@ import java.util.Set;
 import org.apache.jackrabbit.oak.api.PropertyValue;
 import org.apache.jackrabbit.oak.api.Tree;
 import org.apache.jackrabbit.oak.api.Type;
+import org.apache.jackrabbit.oak.api.Result.SizePrecision;
 import org.apache.jackrabbit.oak.namepath.JcrPathParser;
 import org.apache.jackrabbit.oak.namepath.NamePathMapper;
 import org.apache.jackrabbit.oak.query.ast.AndImpl;
@@ -806,6 +808,7 @@ public class QueryImpl implements Query {
         IndexPlan bestPlan = null;
         for (QueryIndex index : indexProvider.getQueryIndexes(rootState)) {
             double cost;
+            String indexName = index.getIndexName();
             IndexPlan indexPlan = null;
             if (index instanceof AdvancedQueryIndex) {
                 AdvancedQueryIndex advIndex = (AdvancedQueryIndex) index;
@@ -853,6 +856,9 @@ public class QueryImpl implements Query {
                     double c = p.getCostPerExecution() + entryCount * p.getCostPerEntry();
                     if (c < cost) {
                         cost = c;
+                        if (p.getPlanName() != null) {
+                            indexName += "[" + p.getPlanName() + "]";
+                        }
                         indexPlan = p;
                     }
                 }
@@ -860,10 +866,10 @@ public class QueryImpl implements Query {
                 cost = index.getCost(filter, rootState);
             }
             if (LOG.isDebugEnabled()) {
-                logDebug("cost for " + index.getIndexName() + " is " + cost);
+                logDebug("cost for " + indexName + " is " + cost);
             }
             if (cost < 0) {
-                LOG.error("cost below 0 for " + index.getIndexName() + " is " + cost);
+                LOG.error("cost below 0 for " + indexName + " is " + cost);
             }
             if (cost < bestCost) {
                 bestCost = cost;
@@ -979,6 +985,12 @@ public class QueryImpl implements Query {
     public long getSize() {
         return size;
     }
+    
+    @Override
+    public long getSize(SizePrecision precision, long max) {
+        // Note: DISTINCT is ignored
+        return Math.min(limit, source.getSize(precision, max));
+    }
 
     public String getStatement() {
         return statement;
@@ -995,6 +1007,21 @@ public class QueryImpl implements Query {
 
     public ExecutionContext getExecutionContext() {
         return context;
+    }
+    
+    /**
+     * Add two values, but don't let it overflow or underflow.
+     * 
+     * @param x the first value
+     * @param y the second value
+     * @return the sum, or Long.MIN_VALUE for underflow, or Long.MAX_VALUE for
+     *         overflow
+     */
+    public static long saturatedAdd(long x, long y) {
+        BigInteger min = BigInteger.valueOf(Long.MIN_VALUE);
+        BigInteger max = BigInteger.valueOf(Long.MAX_VALUE);
+        BigInteger sum = BigInteger.valueOf(x).add(BigInteger.valueOf(y));
+        return sum.min(max).max(min).longValue();
     }
 
 }

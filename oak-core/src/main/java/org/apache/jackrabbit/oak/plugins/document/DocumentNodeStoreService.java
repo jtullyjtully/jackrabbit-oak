@@ -27,6 +27,7 @@ import static org.apache.jackrabbit.oak.plugins.document.DocumentMK.Builder.DEFA
 import static org.apache.jackrabbit.oak.plugins.document.DocumentMK.Builder.DEFAULT_DOC_CHILDREN_CACHE_PERCENTAGE;
 import static org.apache.jackrabbit.oak.plugins.document.DocumentMK.Builder.DEFAULT_NODE_CACHE_PERCENTAGE;
 import static org.apache.jackrabbit.oak.spi.whiteboard.WhiteboardUtils.registerMBean;
+import static org.apache.jackrabbit.oak.spi.whiteboard.WhiteboardUtils.scheduleWithFixedDelay;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -44,11 +45,11 @@ import com.mongodb.DB;
 import com.mongodb.MongoClient;
 import com.mongodb.MongoClientOptions;
 import com.mongodb.MongoClientURI;
+
 import org.apache.felix.scr.annotations.Activate;
 import org.apache.felix.scr.annotations.Component;
 import org.apache.felix.scr.annotations.ConfigurationPolicy;
 import org.apache.felix.scr.annotations.Deactivate;
-import org.apache.felix.scr.annotations.Modified;
 import org.apache.felix.scr.annotations.Property;
 import org.apache.felix.scr.annotations.PropertyOption;
 import org.apache.felix.scr.annotations.Reference;
@@ -102,6 +103,8 @@ public class DocumentNodeStoreService {
     private static final int DEFAULT_BLOB_CACHE_SIZE = 16;
     private static final String DEFAULT_DB = "oak";
     private static final String DEFAULT_PERSISTENT_CACHE = "";
+    private static final int DEFAULT_CACHE_SEGMENT_COUNT = 16;
+    private static final int DEFAULT_CACHE_STACK_MOVE_DISTANCE = 16;
     private static final String PREFIX = "oak.documentstore.";
     private static final String DESCRIPTION = "oak.nodestore.description";
 
@@ -161,6 +164,23 @@ public class DocumentNodeStoreService {
     )
     private static final String PROP_DOC_CHILDREN_CACHE_PERCENTAGE = "docChildrenCachePercentage";
 
+    @Property(intValue = DocumentMK.Builder.DEFAULT_CACHE_SEGMENT_COUNT,
+            label = "LIRS Cache Segment Count",
+            description = "The number of segments in the LIRS cache " + 
+                    "(default 16, a higher count means higher concurrency " + 
+                    "but slightly lower cache hit rate)"
+    )
+    private static final String PROP_CACHE_SEGMENT_COUNT = "cacheSegmentCount";
+
+    @Property(intValue = DocumentMK.Builder.DEFAULT_CACHE_STACK_MOVE_DISTANCE,
+            label = "LIRS Cache Stack Move Distance",
+            description = "The delay to move entries to the head of the queue " + 
+                    "in the LIRS cache " +
+                    "(default 16, a higher value means higher concurrency " + 
+                    "but slightly lower cache hit rate)"
+    )
+    private static final String PROP_CACHE_STACK_MOVE_DISTANCE = "cacheStackMoveDistance";
+
     private static final String PROP_OFF_HEAP_CACHE = "offHeapCache";
 
     @Property(intValue =  DEFAULT_CHANGES_SIZE,
@@ -191,17 +211,23 @@ public class DocumentNodeStoreService {
     )
     public static final String CUSTOM_BLOB_STORE = "customBlobStore";
 
-    /**
-     * Boolean value indicating a different DataSource has to be used for
-     * BlobStore
-     */
-    @Property(boolValue = false,
-            label = "Custom DataSource",
-            description = "Boolean value indicating that DataSource is configured " +
-                    "separately, and that it should be used"
+    private static final long DEFAULT_JOURNAL_GC_INTERVAL_MILLIS = 5*60*1000; // default is 5min
+    @Property(longValue = DEFAULT_JOURNAL_GC_INTERVAL_MILLIS,
+            label = "Journal Garbage Collection Interval (millis)",
+            description = "Long value indicating interval (in milliseconds) with which the "
+                    + "journal (for external changes) is cleaned up. Default is " + DEFAULT_JOURNAL_GC_INTERVAL_MILLIS
     )
-    public static final String CUSTOM_BLOB_DATA_SOURCE = "customBlobDataSource";
-
+    private static final String PROP_JOURNAL_GC_INTERVAL_MILLIS = "journalGCInterval";
+    
+    private static final long DEFAULT_JOURNAL_GC_MAX_AGE_MILLIS = 6*60*60*1000; // default is 6hours
+    @Property(longValue = DEFAULT_JOURNAL_GC_MAX_AGE_MILLIS,
+            label = "Maximum Age of Journal Entries (millis)",
+            description = "Long value indicating max age (in milliseconds) that "
+                    + "journal (for external changes) entries are kept (older ones are candidates for gc). "
+                    + "Default is " + DEFAULT_JOURNAL_GC_MAX_AGE_MILLIS
+    )
+    private static final String PROP_JOURNAL_GC_MAX_AGE_MILLIS = "journalGCMaxAge";
+    
     private static final long MB = 1024 * 1024;
 
     private static enum DocumentStoreType {
@@ -241,6 +267,7 @@ public class DocumentNodeStoreService {
     private ObserverTracker observerTracker;
     private ComponentContext context;
     private Whiteboard whiteboard;
+    private long deactivationTimestamp = 0;
 
 
     /**
@@ -255,14 +282,13 @@ public class DocumentNodeStoreService {
                     "considered for GC. This also applies how older revision of live document are GC."
     )
     public static final String PROP_VER_GC_MAX_AGE = "versionGcMaxAgeInSecs";
-    private long versionGcMaxAgeInSecs = DEFAULT_VER_GC_MAX_AGE;
 
     public static final String PROP_REV_RECOVERY_INTERVAL = "lastRevRecoveryJobIntervalInSecs";
 
     /**
      * Blob modified before this time duration would be considered for Blob GC
      */
-    private static final long DEFAULT_BLOB_GC_MAX_AGE = 24 * 60 * 60; //TimeUnit.HOURS.toSeconds(24);
+    private static final long DEFAULT_BLOB_GC_MAX_AGE = 24 * 60 * 60;
     @Property (longValue = DEFAULT_BLOB_GC_MAX_AGE,
             label = "Blob GC Max Age (in secs)",
             description = "Blob Garbage Collector (GC) logic will only consider those blobs for GC which " +
@@ -271,9 +297,8 @@ public class DocumentNodeStoreService {
                     "considered for GC"
     )
     public static final String PROP_BLOB_GC_MAX_AGE = "blobGcMaxAgeInSecs";
-    private long blobGcMaxAgeInSecs = DEFAULT_BLOB_GC_MAX_AGE;
 
-    private static final long DEFAULT_MAX_REPLICATION_LAG = 6 * 60 * 60; //TimeUnit.HOURS.toSeconds(6);
+    private static final long DEFAULT_MAX_REPLICATION_LAG = 6 * 60 * 60;
     @Property(longValue = DEFAULT_MAX_REPLICATION_LAG,
             label = "Max Replication Lag (in secs)",
             description = "Value in seconds. Determines the duration beyond which it can be safely assumed " +
@@ -294,7 +319,6 @@ public class DocumentNodeStoreService {
     private DocumentStoreType documentStoreType;
 
     private boolean customBlobStore;
-    private boolean customBlobDataSource;
 
     @Activate
     protected void activate(ComponentContext context, Map<String, ?> config) throws Exception {
@@ -304,23 +328,23 @@ public class DocumentNodeStoreService {
         executor.start(whiteboard);
         maxReplicationLagInSecs = toLong(config.get(PROP_REPLICATION_LAG), DEFAULT_MAX_REPLICATION_LAG);
         customBlobStore = toBoolean(prop(CUSTOM_BLOB_STORE), false);
-        customBlobDataSource = toBoolean(prop(CUSTOM_BLOB_DATA_SOURCE), false);
         documentStoreType = DocumentStoreType.fromString(PropertiesUtil.toString(config.get(PROP_DS_TYPE), "MONGO"));
 
-        modified(config);
         registerNodeStoreIfPossible();
     }
 
     private void registerNodeStoreIfPossible() throws IOException {
-        if (context == null) {
+        // disallow attempts to restart (OAK-3420)
+        if (deactivationTimestamp != 0) {
+            log.info("DocumentNodeStore was already unregistered ({}ms ago)", System.currentTimeMillis() - deactivationTimestamp);
+        } else if (context == null) {
             log.info("Component still not activated. Ignoring the initialization call");
         } else if (customBlobStore && blobStore == null) {
-            log.info("BlobStore use enabled. DocumentNodeStoreService would be initialized when "
+            log.info("Custom BlobStore use enabled. DocumentNodeStoreService would be initialized when "
                     + "BlobStore would be available");
-        } else if (documentStoreType == DocumentStoreType.RDB
-                && (dataSource == null || (customBlobDataSource && blobDataSource == null))) {
+        } else if (documentStoreType == DocumentStoreType.RDB && (dataSource == null || blobDataSource == null)) {
             log.info("DataSource use enabled. DocumentNodeStoreService would be initialized when "
-                    + "DataSource would be available");
+                    + "DataSource would be available (currently available: nodes: {}, blobs: {})", dataSource, blobDataSource);
         } else {
             registerNodeStore();
         }
@@ -339,6 +363,8 @@ public class DocumentNodeStoreService {
         int changesSize = toInteger(prop(PROP_CHANGES_SIZE), DEFAULT_CHANGES_SIZE);
         int blobCacheSize = toInteger(prop(PROP_BLOB_CACHE_SIZE), DEFAULT_BLOB_CACHE_SIZE);
         String persistentCache = PropertiesUtil.toString(prop(PROP_PERSISTENT_CACHE), DEFAULT_PERSISTENT_CACHE);
+        int cacheSegmentCount = toInteger(prop(PROP_CACHE_SEGMENT_COUNT), DEFAULT_CACHE_SEGMENT_COUNT);
+        int cacheStackMoveDistance = toInteger(prop(PROP_CACHE_STACK_MOVE_DISTANCE), DEFAULT_CACHE_STACK_MOVE_DISTANCE);
 
         DocumentMK.Builder mkBuilder =
                 new DocumentMK.Builder().
@@ -348,8 +374,10 @@ public class DocumentNodeStoreService {
                         childrenCachePercentage, 
                         docChildrenCachePercentage, 
                         diffCachePercentage).
+                setCacheSegmentCount(cacheSegmentCount).
+                setCacheStackMoveDistance(cacheStackMoveDistance).
                 offHeapCacheSize(offHeapCache * MB);
-        
+
         if (persistentCache != null && persistentCache.length() > 0) {
             mkBuilder.setPersistentCache(persistentCache);
         }
@@ -361,14 +389,16 @@ public class DocumentNodeStoreService {
             mkBuilder.setBlobStore(blobStore);
         }
 
-        if (documentStoreType == DocumentStoreType.RDB){
+        if (documentStoreType == DocumentStoreType.RDB) {
             checkNotNull(dataSource, "DataStore type set [%s] but DataSource reference not initialized", PROP_DS_TYPE);
-            if(customBlobDataSource){
-                checkNotNull(blobDataSource, "DataStore type set [%s] and BlobStore is configured to use different " +
-                        "DataSource via [%s] but BlobDataSource reference not initialized", PROP_DS_TYPE, CUSTOM_BLOB_DATA_SOURCE);
+            if (!customBlobStore) {
+                checkNotNull(blobDataSource, "DataStore type set [%s] but BlobDataSource reference not initialized", PROP_DS_TYPE);
                 mkBuilder.setRDBConnection(dataSource, blobDataSource);
                 log.info("Connected to datasources {} {}", dataSource, blobDataSource);
             } else {
+                if (blobDataSource != null && blobDataSource != dataSource) {
+                    log.info("Ignoring blobDataSource {} as custom blob store takes precedence.", blobDataSource);
+                }
                 mkBuilder.setRDBConnection(dataSource);
                 log.info("Connected to datasource {}", dataSource);
             }
@@ -410,6 +440,7 @@ public class DocumentNodeStoreService {
 
         registerJMXBeans(mk.getNodeStore());
         registerLastRevRecoveryJob(mk.getNodeStore());
+        registerJournalGC(mk.getNodeStore());
 
         NodeStore store;
         DocumentNodeStore mns = mk.getNodeStore();
@@ -424,15 +455,6 @@ public class DocumentNodeStoreService {
         props.put(Constants.SERVICE_PID, DocumentNodeStore.class.getName());
         props.put(DESCRIPTION, getMetadata(ds));
         reg = context.getBundleContext().registerService(NodeStore.class.getName(), store, props);
-    }
-
-    /**
-     * At runtime DocumentNodeStore only pickup modification of certain properties
-     */
-    @Modified
-    protected void modified(Map<String, ?> config){
-        versionGcMaxAgeInSecs = toLong(config.get(PROP_VER_GC_MAX_AGE), DEFAULT_VER_GC_MAX_AGE);
-        blobGcMaxAgeInSecs = toLong(config.get(PROP_BLOB_GC_MAX_AGE), DEFAULT_BLOB_GC_MAX_AGE);
     }
 
     @Deactivate
@@ -459,6 +481,7 @@ public class DocumentNodeStoreService {
 
     @SuppressWarnings("UnusedDeclaration")
     protected void bindDataSource(DataSource dataSource) throws IOException {
+        log.info("Initializing DocumentNodeStore with dataSource [{}]", dataSource);
         this.dataSource = dataSource;
         registerNodeStoreIfPossible();
     }
@@ -471,6 +494,7 @@ public class DocumentNodeStoreService {
 
     @SuppressWarnings("UnusedDeclaration")
     protected void bindBlobDataSource(DataSource dataSource) throws IOException {
+        log.info("Initializing DocumentNodeStore with blobDataSource [{}]", dataSource);
         this.blobDataSource = dataSource;
         registerNodeStoreIfPossible();
     }
@@ -482,16 +506,21 @@ public class DocumentNodeStoreService {
     }
 
     private void unregisterNodeStore() {
+        deactivationTimestamp = System.currentTimeMillis();
+
         for (Registration r : registrations) {
             r.unregister();
         }
+        registrations.clear();
 
         if (reg != null) {
             reg.unregister();
+            reg = null;
         }
 
         if (mk != null) {
             mk.dispose();
+            mk = null;
         }
 
         if (executor != null) {
@@ -554,15 +583,12 @@ public class DocumentNodeStoreService {
                         "Document node store management")
         );
 
+        final long versionGcMaxAgeInSecs = toLong(prop(PROP_VER_GC_MAX_AGE), DEFAULT_VER_GC_MAX_AGE);
+        final long blobGcMaxAgeInSecs = toLong(prop(PROP_BLOB_GC_MAX_AGE), DEFAULT_BLOB_GC_MAX_AGE);
+
         if (store.getBlobStore() instanceof GarbageCollectableBlobStore) {
-            BlobGarbageCollector gc = new BlobGarbageCollector() {
-                @Override
-                public void collectGarbage(boolean sweep) throws Exception {
-                    store.createBlobGarbageCollector(blobGcMaxAgeInSecs,
-                            ClusterRepositoryInfo.getId(mk.getNodeStore()))
-                            .collectGarbage(sweep);
-                }
-            };
+            BlobGarbageCollector gc = store.createBlobGarbageCollector(blobGcMaxAgeInSecs, 
+                                                        ClusterRepositoryInfo.getId(mk.getNodeStore()));
             registrations.add(registerMBean(whiteboard, BlobGCMBean.class, new BlobGC(gc, executor),
                     BlobGCMBean.TYPE, "Document node store blob garbage collection"));
         }
@@ -594,6 +620,23 @@ public class DocumentNodeStoreService {
         };
         registrations.add(WhiteboardUtils.scheduleWithFixedDelay(whiteboard,
                 recoverJob, TimeUnit.MILLISECONDS.toSeconds(leaseTime)));
+    }
+
+    private void registerJournalGC(final DocumentNodeStore nodeStore) {
+        long journalGCInterval = toLong(context.getProperties().get(PROP_JOURNAL_GC_INTERVAL_MILLIS),
+                DEFAULT_JOURNAL_GC_INTERVAL_MILLIS);
+        final long journalGCMaxAge = toLong(context.getProperties().get(PROP_JOURNAL_GC_MAX_AGE_MILLIS),
+                DEFAULT_JOURNAL_GC_MAX_AGE_MILLIS);
+        Runnable journalGCJob = new Runnable() {
+
+            @Override
+            public void run() {
+                nodeStore.getJournalGarbageCollector().gc(journalGCMaxAge, TimeUnit.MILLISECONDS);
+            }
+
+        };
+        registrations.add(WhiteboardUtils.scheduleWithFixedDelay(whiteboard,
+                journalGCJob, TimeUnit.MILLISECONDS.toSeconds(journalGCInterval), true/*runOnSingleClusterNode*/));
     }
 
     private Object prop(String propName) {

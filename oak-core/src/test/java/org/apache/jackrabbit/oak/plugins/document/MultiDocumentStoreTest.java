@@ -44,6 +44,7 @@ public class MultiDocumentStoreTest extends AbstractMultiDocumentStoreTest {
         up.set("_id", id);
         up.set("_foo", 0l);
         assertTrue(super.ds1.create(Collection.NODES, Collections.singletonList(up)));
+        removeMe.add(id);
 
         long increments = 10;
 
@@ -58,7 +59,6 @@ public class MultiDocumentStoreTest extends AbstractMultiDocumentStoreTest {
                 super.ds2.update(Collection.NODES, Collections.singletonList(id), up);
             }
         }
-        removeMe.add(id);
 
         // read uncached
         nd = super.ds1.find(Collection.NODES, id, 0);
@@ -77,7 +77,10 @@ public class MultiDocumentStoreTest extends AbstractMultiDocumentStoreTest {
 
         UpdateOp up = new UpdateOp(id, true);
         up.set("_id", id);
+        up.set("_modified", 1L);
         assertTrue(super.ds1.create(Collection.NODES, Collections.singletonList(up)));
+        removeMe.add(id);
+
         nd1 = super.ds1.find(Collection.NODES, id, 0);
         Number n = nd1.getModCount();
         if (n != null) {
@@ -92,6 +95,7 @@ public class MultiDocumentStoreTest extends AbstractMultiDocumentStoreTest {
             UpdateOp upds1 = new UpdateOp(id, true);
             upds1.set("_id", id);
             upds1.set("foo", "bar");
+            upds1.set("_modified", 2L);
             super.ds1.update(Collection.NODES, Collections.singletonList(id), upds1);
             nd1 = super.ds1.find(Collection.NODES, id);
             int oldn1 = n1;
@@ -103,6 +107,7 @@ public class MultiDocumentStoreTest extends AbstractMultiDocumentStoreTest {
             UpdateOp upds2 = new UpdateOp(id, true);
             upds2.set("_id", id);
             upds2.set("foo", "qux");
+            upds2.set("_modified", 3L);
             super.ds2.update(Collection.NODES, Collections.singletonList(id), upds2);
             nd2 = super.ds2.find(Collection.NODES, id);
             n2 = nd2.getModCount().intValue();
@@ -113,10 +118,26 @@ public class MultiDocumentStoreTest extends AbstractMultiDocumentStoreTest {
             upds1 = new UpdateOp(id, true);
             upds1.set("_id", id);
             upds1.set("foo", "barbar");
+            upds1.max("_modified", 0L);
             NodeDocument prev = super.ds1.findAndUpdate(Collection.NODES, upds1);
             // prev document should contain mod from DS2
             assertEquals("qux", prev.get("foo"));
             assertEquals(oldn1 + 2, prev.getModCount().intValue());
+            assertEquals(3L, prev.getModified().intValue());
+
+            // the new document must not have a _modified time smaller than
+            // before the update
+            nd1 = super.ds1.find(Collection.NODES, id, 0);
+            assertEquals(super.dsname + ": _modified value must never ever get smaller", 3L, nd1.getModified().intValue());
+
+            // verify that _modified can indeed be *set* to a smaller value, see
+            // https://issues.apache.org/jira/browse/OAK-2940
+            upds1 = new UpdateOp(id, true);
+            upds1.set("_id", id);
+            upds1.set("_modified", 0L);
+            super.ds1.findAndUpdate(Collection.NODES, upds1);
+            nd1 = super.ds1.find(Collection.NODES, id, 0);
+            assertEquals(super.dsname + ": _modified value must be set to 0", 0L, nd1.getModified().intValue());
         }
     }
 
@@ -136,6 +157,7 @@ public class MultiDocumentStoreTest extends AbstractMultiDocumentStoreTest {
         up.set("_id", id);
         up.set("_foo", "bar");
         assertTrue(super.ds1.create(Collection.NODES, Collections.singletonList(up)));
+        removeMe.add(id);
 
         // fill both caches
         NodeDocument nd1 = super.ds1.find(Collection.NODES, id);

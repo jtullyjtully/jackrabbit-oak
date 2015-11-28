@@ -23,7 +23,7 @@
   <parent>
     <groupId>org.apache.jackrabbit</groupId>
     <artifactId>oak-parent</artifactId>
-    <version>1.4-SNAPSHOT</version>
+    <version>1.2.9-SNAPSHOT</version>
     <relativePath>../oak-parent/pom.xml</relativePath>
   </parent>
 
@@ -50,6 +50,7 @@
               org.apache.jackrabbit.oak.api.jmx,
               org.apache.jackrabbit.oak.stats,
               org.apache.jackrabbit.oak.json,
+              org.apache.jackrabbit.oak.kernel,
               org.apache.jackrabbit.oak.management,
               org.apache.jackrabbit.oak.util,
               org.apache.jackrabbit.oak.namepath,
@@ -59,6 +60,7 @@
               org.apache.jackrabbit.oak.plugins.commit,
               org.apache.jackrabbit.oak.plugins.identifier,
               org.apache.jackrabbit.oak.plugins.index,
+              org.apache.jackrabbit.oak.plugins.index.fulltext,
               org.apache.jackrabbit.oak.plugins.index.aggregate,
               org.apache.jackrabbit.oak.plugins.index.counter,
               org.apache.jackrabbit.oak.plugins.index.nodetype,
@@ -182,6 +184,11 @@
     <!-- Dependencies to other Oak components -->
     <dependency>
       <groupId>org.apache.jackrabbit</groupId>
+      <artifactId>oak-mk-api</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.jackrabbit</groupId>
       <artifactId>oak-commons</artifactId>
       <version>${project.version}</version>
     </dependency>
@@ -290,12 +297,6 @@
       <optional>true</optional>
     </dependency>
 
-    <dependency>
-      <groupId>commons-dbcp</groupId>
-      <artifactId>commons-dbcp</artifactId>
-      <version>1.4</version>
-    </dependency>
-
     <!-- Logging -->
     <dependency>
       <groupId>org.slf4j</groupId>
@@ -345,6 +346,12 @@
     <dependency>
       <groupId>commons-lang</groupId>
       <artifactId>commons-lang</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.tomcat</groupId>
+      <artifactId>tomcat-jdbc</artifactId>
+      <version>7.0.64</version>
       <scope>test</scope>
     </dependency>
   </dependencies>

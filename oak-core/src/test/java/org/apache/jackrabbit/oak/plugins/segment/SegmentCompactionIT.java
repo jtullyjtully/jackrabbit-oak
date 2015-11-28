@@ -118,7 +118,7 @@ public class SegmentCompactionIT {
             false, false, CLEAN_OLD, 60000, MEMORY_THRESHOLD_DEFAULT) {
         @Override
         public boolean compacted(@Nonnull Callable<Boolean> setHead) throws Exception {
-            return nodeStore.locked(setHead, lockWaitTime, SECONDS);
+            return nodeStore.locked(setHead);
         }
     };
 
@@ -128,7 +128,6 @@ public class SegmentCompactionIT {
     private Registration mBeanRegistration;
 
     private volatile ListenableFuture<?> compactor = immediateCancelledFuture();
-    private volatile int lockWaitTime = 60;
     private volatile int maxReaders = 10;
     private volatile int maxWriters = 10;
     private volatile long maxStoreSize = 200000000000L;
@@ -622,16 +621,6 @@ public class SegmentCompactionIT {
         @Override
         public String getLastCompaction() {
             return valueOf(new Date(gcMonitor.getLastCompacted()));
-        }
-
-        @Override
-        public void setLockWaitTime(int seconds) {
-            lockWaitTime = seconds;
-        }
-
-        @Override
-        public int getLockWaitTime() {
-            return lockWaitTime;
         }
 
         @Override

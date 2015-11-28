@@ -36,6 +36,8 @@ import org.apache.jackrabbit.oak.query.fulltext.FullTextExpression;
 import org.apache.jackrabbit.oak.query.fulltext.FullTextTerm;
 import org.apache.jackrabbit.oak.query.fulltext.FullTextVisitor;
 import org.apache.jackrabbit.oak.spi.query.Filter;
+import org.apache.jackrabbit.oak.spi.query.QueryConstants;
+import org.apache.jackrabbit.oak.spi.query.Filter.PropertyRestriction;
 import org.apache.lucene.index.IndexReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -145,13 +147,17 @@ class IndexPlanner {
         //for property index
         if (indexingRule.propertyIndexEnabled) {
             for (PropertyRestriction pr : filter.getPropertyRestrictions()) {
+                String name = pr.propertyName;
+                if (QueryConstants.RESTRICTION_LOCAL_NAME.equals(name)) {
+                    continue;
+                }
                 PropertyDefinition pd = indexingRule.getConfig(pr.propertyName);
                 if (pd != null && pd.propertyIndexEnabled()) {
                     if (pr.isNullRestriction() && !pd.nullCheckEnabled){
                         continue;
                     }
-                    indexedProps.add(pr.propertyName);
-                    result.propDefns.put(pr.propertyName, pd);
+                    indexedProps.add(name);
+                    result.propDefns.put(name, pd);
                 }
             }
         }
@@ -159,6 +165,7 @@ class IndexPlanner {
         boolean evalNodeTypeRestrictions = canEvalNodeTypeRestrictions(indexingRule);
         boolean evalPathRestrictions = canEvalPathRestrictions(indexingRule);
         boolean canEvalAlFullText = canEvalAllFullText(indexingRule, ft);
+        boolean canEvalNodeNameRestriction = canEvalNodeNameRestriction(indexingRule);
 
         if (ft != null && !canEvalAlFullText){
             return null;
@@ -168,7 +175,8 @@ class IndexPlanner {
 
         List<OrderEntry> sortOrder = createSortOrder(indexingRule);
         boolean canSort = canSortByProperty(sortOrder);
-        if (!indexedProps.isEmpty() || canSort || ft != null || evalPathRestrictions || evalNodeTypeRestrictions) {
+        if (!indexedProps.isEmpty() || canSort || ft != null
+                || evalPathRestrictions || evalNodeTypeRestrictions || canEvalNodeNameRestriction) {
             //TODO Need a way to have better cost estimate to indicate that
             //this index can evaluate more propertyRestrictions natively (if more props are indexed)
             //For now we reduce cost per entry
@@ -192,6 +200,10 @@ class IndexPlanner {
 
             if (evalNodeTypeRestrictions){
                 result.enableNodeTypeEvaluation();
+            }
+
+            if (canEvalNodeNameRestriction){
+                result.enableNodeNameRestriction();
             }
 
             return plan.setCostPerEntry(definition.getCostPerEntry() / costPerEntryFactor);
@@ -226,6 +238,14 @@ class IndexPlanner {
         return false;
     }
 
+    private boolean canEvalNodeNameRestriction(IndexingRule indexingRule) {
+        PropertyRestriction pr = filter.getPropertyRestriction(QueryConstants.RESTRICTION_LOCAL_NAME);
+        if (pr == null){
+            return false;
+        }
+        return indexingRule.isNodeNameIndexed();
+    }
+
     private static boolean canSortByProperty(List<OrderEntry> sortOrder) {
         if (sortOrder.isEmpty()) {
             return false;
@@ -248,6 +268,7 @@ class IndexPlanner {
         final HashSet<String> relPaths = new HashSet<String>();
         final HashSet<String> nonIndexedPaths = new HashSet<String>();
         final AtomicBoolean relativeParentsFound = new AtomicBoolean();
+        final AtomicBoolean nodeScopedCondition = new AtomicBoolean();
         ft.accept(new FullTextVisitor.FullTextVisitorBase() {
             @Override
             public boolean visit(FullTextContains contains) {
@@ -290,8 +311,16 @@ class IndexPlanner {
                         && !indexingRule.isIndexed(propertyPath)){
                     nonIndexedPaths.add(p);
                 }
+
+                if (nodeScopedTerm(propertyName)){
+                    nodeScopedCondition.set(true);
+                }
             }
         });
+
+        if (nodeScopedCondition.get() && !indexingRule.isNodeFullTextIndexed()){
+            return false;
+        }
 
         if (relativeParentsFound.get()){
             log.debug("Relative parents found {} which are not supported", relPaths);
@@ -315,7 +344,12 @@ class IndexPlanner {
     }
 
     private boolean canEvalPathRestrictions(IndexingRule rule) {
-        if (filter.getPathRestriction() == Filter.PathRestriction.NO_RESTRICTION){
+        //Opt out if one is looking for all children for '/' as its equivalent to
+        //NO_RESTRICTION
+        if (filter.getPathRestriction() == Filter.PathRestriction.NO_RESTRICTION
+                || (filter.getPathRestriction() == Filter.PathRestriction.ALL_CHILDREN
+                        && PathUtils.denotesRoot(filter.getPath()))
+                ){
             return false;
         }
         //If no other restrictions is provided and query is pure
@@ -346,7 +380,8 @@ class IndexPlanner {
                 .setPathPrefix(getPathPrefix())
                 .setDelayed(true) //Lucene is always async
                 .setAttribute(LucenePropertyIndex.ATTR_PLAN_RESULT, result)
-                .setEstimatedEntryCount(estimatedEntryCount());
+                .setEstimatedEntryCount(estimatedEntryCount())
+                .setPlanName(indexPath);
     }
 
     private long estimatedEntryCount() {
@@ -427,13 +462,21 @@ class IndexPlanner {
     private boolean notSupportedFeature() {
         if(filter.getPathRestriction() == Filter.PathRestriction.NO_RESTRICTION
                 && filter.matchesAllTypes()
-                && filter.getPropertyRestrictions().isEmpty()){
+                && filter.getPropertyRestrictions().isEmpty()) {
             //This mode includes name(), localname() queries
             //OrImpl [a/name] = 'Hello' or [b/name] = 'World'
             //Relative parent properties where [../foo1] is not null
             return true;
         }
         return false;
+    }
+
+    /**
+     * Determine if the propertyName of a fulltext term indicates current node
+     * @param propertyName property name in the full text term clause
+     */
+    private static boolean nodeScopedTerm(String propertyName) {
+        return propertyName == null || ".".equals(propertyName) || "*".equals(propertyName);
     }
 
     //~--------------------------------------------------------< PlanResult >
@@ -450,6 +493,7 @@ class IndexPlanner {
         private String parentPathSegment;
         private boolean relativize;
         private boolean nodeTypeRestrictions;
+        private boolean nodeNameRestriction;
 
         public PlanResult(String indexPath, IndexDefinition defn, IndexingRule indexingRule) {
             this.indexPath = indexPath;
@@ -499,6 +543,8 @@ class IndexPlanner {
             return nodeTypeRestrictions;
         }
 
+        public boolean evaluateNodeNameRestriction() {return nodeNameRestriction;}
+
         private void setParentPath(String relativePath){
             parentPathSegment = "/" + relativePath;
             if (relativePath.isEmpty()){
@@ -517,6 +563,10 @@ class IndexPlanner {
 
         private void enableNodeTypeEvaluation() {
             nodeTypeRestrictions = true;
+        }
+
+        private void enableNodeNameRestriction(){
+            nodeNameRestriction = true;
         }
     }
 }

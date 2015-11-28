@@ -107,6 +107,11 @@ public class SynchronizingDocumentStoreWrapper implements DocumentStore {
     }
 
     @Override
+    public synchronized CacheInvalidationStats invalidateCache(Iterable<String> keys) {
+        return store.invalidateCache(keys);
+    }
+    
+    @Override
     public synchronized <T extends Document> void invalidateCache(Collection<T> collection, String key) {
         store.invalidateCache(collection, key);
     }
@@ -129,6 +134,11 @@ public class SynchronizingDocumentStoreWrapper implements DocumentStore {
     @Override
     public synchronized CacheStats getCacheStats() {
         return store.getCacheStats();
+    }
+    
+    @Override
+    public synchronized long determineServerTimeDifferenceMillis() {
+    	return store.determineServerTimeDifferenceMillis();
     }
 
     @Override

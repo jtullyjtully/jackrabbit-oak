@@ -85,8 +85,11 @@ public class CompactionMap {
     private long[] afterMsbs = new long[0];
     private long[] afterLsbs = new long[0];
 
-    private long prevWeight;
     private CompactionMap prev;
+
+    CompactionMap(SegmentTracker tracker) {
+        this(Integer.getInteger("compress-interval", 100000), tracker);
+    }
 
     CompactionMap(int compressInterval, SegmentTracker tracker) {
         this.compressInterval = compressInterval;
@@ -433,7 +436,6 @@ public class CompactionMap {
      */
     void merge(CompactionMap prev) {
         this.prev = prev;
-        this.prevWeight = prev.getEstimatedWeight();
     }
 
     public String getCompactionStats() {
@@ -485,8 +487,12 @@ public class CompactionMap {
 
     }
 
-    public long getLastMergeWeight() {
-        return this.prevWeight;
+    /**
+     * The weight of the last generation of the compaction map.
+     * @return  Estimated weight of the last generation of the compaction map.
+     */
+    public long getLastWeight() {
+        return getEstimatedWeight(this);
     }
 
     private static long getEstimatedWeight(CompactionMap cm) {

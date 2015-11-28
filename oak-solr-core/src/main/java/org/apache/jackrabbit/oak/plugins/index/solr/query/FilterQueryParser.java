@@ -21,6 +21,7 @@ import java.util.List;
 import javax.jcr.PropertyType;
 
 import org.apache.jackrabbit.oak.plugins.index.solr.configuration.OakSolrConfiguration;
+import org.apache.jackrabbit.oak.query.QueryImpl;
 import org.apache.jackrabbit.oak.query.fulltext.FullTextAnd;
 import org.apache.jackrabbit.oak.query.fulltext.FullTextContains;
 import org.apache.jackrabbit.oak.query.fulltext.FullTextExpression;
@@ -74,6 +75,8 @@ class FilterQueryParser {
                 String sortingField;
                 if ("jcr:path".equals(orderEntry.getPropertyName())) {
                     sortingField = configuration.getPathField();
+                } else if ("jcr:score".equals(orderEntry.getPropertyName())) {
+                    sortingField = "score";
                 } else {
                     sortingField = getSortingField(orderEntry.getPropertyType().tag(), orderEntry.getPropertyName());
                 }
@@ -198,19 +201,34 @@ class FilterQueryParser {
 
         if (configuration.useForPrimaryTypes()) {
             String[] pts = filter.getPrimaryTypes().toArray(new String[filter.getPrimaryTypes().size()]);
+            StringBuilder ptQueryBuilder = new StringBuilder();
             for (int i = 0; i < pts.length; i++) {
                 String pt = pts[i];
                 if (i == 0) {
-                    queryBuilder.append("(");
+                    ptQueryBuilder.append("(");
                 }
                 if (i > 0 && i < pts.length) {
-                    queryBuilder.append("OR ");
+                    ptQueryBuilder.append("OR ");
                 }
-                queryBuilder.append("jcr\\:primaryType").append(':').append(partialEscape(pt)).append(" ");
+                ptQueryBuilder.append("jcr\\:primaryType").append(':').append(partialEscape(pt)).append(" ");
                 if (i == pts.length - 1) {
-                    queryBuilder.append(")");
-                    queryBuilder.append(' ');
+                    ptQueryBuilder.append(")");
+                    ptQueryBuilder.append(' ');
                 }
+            }
+            solrQuery.addFilterQuery(ptQueryBuilder.toString());
+        }
+
+        if (filter.getQueryStatement() != null && filter.getQueryStatement().contains(QueryImpl.REP_EXCERPT)) {
+            if (!solrQuery.getHighlight()) {
+                // enable highlighting
+                solrQuery.setHighlight(true);
+                // defaults
+                solrQuery.set("hl.fl", "*");
+                solrQuery.set("hl.encoder", "html");
+                solrQuery.set("hl.mergeContiguous", true);
+                solrQuery.setHighlightSimplePre("<strong>");
+                solrQuery.setHighlightSimplePost("</strong>");
             }
         }
 
@@ -220,11 +238,20 @@ class FilterQueryParser {
                 String path = purgePath(filter);
                 String fieldName = configuration.getFieldForPathRestriction(pathRestriction);
                 if (fieldName != null) {
-                    queryBuilder.append(fieldName);
-                    queryBuilder.append(':');
-                    queryBuilder.append(path);
+                    if (pathRestriction.equals(Filter.PathRestriction.ALL_CHILDREN)) {
+                        solrQuery.addFilterQuery(fieldName + ':' + path);
+                    } else {
+                        queryBuilder.append(fieldName);
+                        queryBuilder.append(':');
+                        queryBuilder.append(path);
+                    }
                 }
             }
+        }
+
+        if (configuration.collapseJcrContentNodes()) {
+            solrQuery.addFilterQuery("{!collapse field=" + configuration.getCollapsedPathField() + " min=" +
+                    configuration.getPathDepthField() + " hint=top_fc nullPolicy=expand}");
         }
 
         if (queryBuilder.length() == 0) {

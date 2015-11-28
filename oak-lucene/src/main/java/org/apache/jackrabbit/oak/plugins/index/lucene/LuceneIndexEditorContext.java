@@ -16,6 +16,7 @@
  */
 package org.apache.jackrabbit.oak.plugins.index.lucene;
 
+import static com.google.common.base.Preconditions.checkNotNull;
 import static org.apache.jackrabbit.oak.commons.IOUtils.humanReadableByteCount;
 import static org.apache.jackrabbit.oak.plugins.index.lucene.LuceneIndexConstants.INDEX_DATA_CHILD_NAME;
 import static org.apache.jackrabbit.oak.plugins.index.lucene.LuceneIndexConstants.PERSISTENCE_PATH;
@@ -30,6 +31,7 @@ import java.util.Calendar;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
+import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import org.apache.commons.io.IOUtils;
@@ -130,18 +132,20 @@ public class LuceneIndexEditorContext {
 
     private final TextExtractionStats textExtractionStats = new TextExtractionStats();
 
+    private final ExtractedTextCache extractedTextCache;
     /**
      * The media types supported by the parser used.
      */
     private Set<MediaType> supportedMediaTypes;
 
     LuceneIndexEditorContext(NodeState root, NodeBuilder definition, IndexUpdateCallback updateCallback,
-                             @Nullable IndexCopier indexCopier) {
+                             @Nullable IndexCopier indexCopier, ExtractedTextCache extractedTextCache) {
         this.definitionBuilder = definition;
         this.indexCopier = indexCopier;
         this.definition = new IndexDefinition(root, definition);
         this.indexedNodes = 0;
         this.updateCallback = updateCallback;
+        this.extractedTextCache = extractedTextCache;
         if (this.definition.isOfOldFormat()){
             IndexDefinition.updateDefinition(definition);
         }
@@ -171,6 +175,37 @@ public class LuceneIndexEditorContext {
         return writer;
     }
 
+    private static void trackIndexSizeInfo(@Nonnull IndexWriter writer,
+                                           @Nonnull IndexDefinition definition,
+                                           @Nonnull Directory directory) throws IOException {
+        checkNotNull(writer);
+        checkNotNull(definition);
+        checkNotNull(directory);
+        
+        int docs = writer.numDocs();
+        int ram = writer.numRamDocs();
+
+        log.trace("Writer for direcory {} - docs: {}, ramDocs: {}", definition, docs, ram);
+        
+        String[] files = directory.listAll();
+        long overallSize = 0;
+        StringBuilder sb = new StringBuilder();
+        for (String f : files) {
+            sb.append(f).append(":");
+            if (directory.fileExists(f)) {
+                long size = directory.fileLength(f);
+                overallSize += size;
+                sb.append(size);
+            } else {
+                sb.append("--");
+            }
+            sb.append(", ");
+        }
+        log.trace("Directory overall size: {}, files: {}",
+            org.apache.jackrabbit.oak.commons.IOUtils.humanReadableByteCount(overallSize),
+            sb.toString());
+    }
+
     /**
      * close writer if it's not null
      */
@@ -184,22 +219,31 @@ public class LuceneIndexEditorContext {
         }
 
         if (writer != null) {
+            if (log.isTraceEnabled()) {
+                trackIndexSizeInfo(writer, definition, directory);
+            }
+            
             final long start = PERF_LOGGER.start();
+            
             updateSuggester();
-
+            PERF_LOGGER.end(start, -1, "Completed suggester for directory {}", definition);
+            
             writer.close();
-
+            PERF_LOGGER.end(start, -1, "Closed writer for directory {}", definition);
+            
             directory.close();
-
+            PERF_LOGGER.end(start, -1, "Closed directory for directory {}", definition);
+            
             //OAK-2029 Record the last updated status so
             //as to make IndexTracker detect changes when index
             //is stored in file system
             NodeBuilder status = definitionBuilder.child(":status");
             status.setProperty("lastUpdated", ISO8601.format(Calendar.getInstance()), Type.DATE);
             status.setProperty("indexedNodes",indexedNodes);
-            PERF_LOGGER.end(start, -1, "Closed IndexWriter for directory {}", definition);
-
+            PERF_LOGGER.end(start, -1, "Overall Closed IndexWriter for directory {}", definition);
+            
             textExtractionStats.log(reindex);
+            textExtractionStats.collectStats(extractedTextCache);
         }
     }
 
@@ -269,8 +313,22 @@ public class LuceneIndexEditorContext {
         return definition;
     }
 
-    public void recordTextExtractionStats(long timeInMillis, long size) {
-        textExtractionStats.addStats(timeInMillis, size);
+    @Deprecated
+    public void recordTextExtractionStats(long timeInMillis, long bytesRead) {
+        //Keeping deprecated method to avoid major version change
+        recordTextExtractionStats(timeInMillis, bytesRead, 0);
+    }
+
+    public void recordTextExtractionStats(long timeInMillis, long bytesRead, int textLength) {
+        textExtractionStats.addStats(timeInMillis, bytesRead, textLength);
+    }
+
+    ExtractedTextCache getExtractedTextCache() {
+        return extractedTextCache;
+    }
+
+    public boolean isReindex() {
+        return reindex;
     }
 
     private static Parser initializeTikaParser(IndexDefinition definition) {
@@ -292,12 +350,10 @@ public class LuceneIndexEditorContext {
     }
 
     private static AutoDetectParser createDefaultParser() {
-        ClassLoader current = Thread.currentThread().getContextClassLoader();
         URL configUrl = LuceneIndexEditorContext.class.getResource("tika-config.xml");
         InputStream is = null;
         if (configUrl != null) {
             try {
-                Thread.currentThread().setContextClassLoader(LuceneIndexEditorContext.class.getClassLoader());
                 is = configUrl.openStream();
                 TikaConfig config = new TikaConfig(is);
                 log.info("Loaded default Tika Config from classpath {}", configUrl);
@@ -306,7 +362,6 @@ public class LuceneIndexEditorContext {
                 log.warn("Tika configuration not available : " + configUrl, e);
             } finally {
                 IOUtils.closeQuietly(is);
-                Thread.currentThread().setContextClassLoader(current);
             }
         } else {
             log.warn("Default Tika configuration not found from {}", configUrl);
@@ -327,15 +382,17 @@ public class LuceneIndexEditorContext {
         /**
          * Log stats only if time spent is more than 2 min
          */
-        private static final long LOGGING_THRESHOLD = TimeUnit.MINUTES.toMillis(2);
+        private static final long LOGGING_THRESHOLD = TimeUnit.MINUTES.toMillis(1);
         private int count;
-        private long totalSize;
+        private long totalBytesRead;
         private long totalTime;
+        private long totalTextLength;
 
-        public void addStats(long timeInMillis, long size) {
+        public void addStats(long timeInMillis, long bytesRead, int textLength) {
             count++;
-            totalSize += size;
+            totalBytesRead += bytesRead;
             totalTime += timeInMillis;
+            totalTextLength += textLength;
         }
 
         public void log(boolean reindex) {
@@ -344,6 +401,10 @@ public class LuceneIndexEditorContext {
             } else if (anyParsingDone() && (reindex || isTakingLotsOfTime())) {
                 log.info("Text extraction stats {}", this);
             }
+        }
+
+        public void collectStats(ExtractedTextCache cache){
+            cache.addStats(count, totalTime, totalBytesRead, totalTextLength);
         }
 
         private boolean isTakingLotsOfTime() {
@@ -356,8 +417,11 @@ public class LuceneIndexEditorContext {
 
         @Override
         public String toString() {
-            return String.format(" %d (%s, %s)", count,
-                    timeInWords(totalTime), humanReadableByteCount(totalSize));
+            return String.format(" %d (Time Taken %s, Bytes Read %s, Extracted text size %s)",
+                    count,
+                    timeInWords(totalTime),
+                    humanReadableByteCount(totalBytesRead),
+                    humanReadableByteCount(totalTextLength));
         }
 
         private static String timeInWords(long millis) {

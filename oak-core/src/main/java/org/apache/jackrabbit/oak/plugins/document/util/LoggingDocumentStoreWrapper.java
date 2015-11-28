@@ -251,6 +251,17 @@ public class LoggingDocumentStoreWrapper implements DocumentStore {
             throw convert(e);
         }
     }
+    
+    @Override
+    public CacheInvalidationStats invalidateCache(Iterable<String> keys) {
+        try {
+            logMethod("invalidateCache", keys);
+            return store.invalidateCache(keys);
+        } catch (Exception e) {
+            logException(e);
+            throw convert(e);
+        }
+    }
 
     @Override
     public <T extends Document> void invalidateCache(Collection<T> collection, String key) {
@@ -321,6 +332,14 @@ public class LoggingDocumentStoreWrapper implements DocumentStore {
     @Override
     public Map<String, String> getMetadata() {
         return store.getMetadata();
+    }
+    
+    @Override
+    public long determineServerTimeDifferenceMillis() {
+    	logMethod("determineServerTimeDifferenceMillis", "start");
+    	long result = store.determineServerTimeDifferenceMillis();
+    	logMethod("determineServerTimeDifferenceMillis", "end", result);
+		return result;
     }
 
     private void logMethod(String methodName, Object... args) {

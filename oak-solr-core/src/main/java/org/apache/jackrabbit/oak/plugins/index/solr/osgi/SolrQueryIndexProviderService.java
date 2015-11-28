@@ -54,7 +54,7 @@ public class SolrQueryIndexProviderService {
 
     private final List<ServiceRegistration> regs = Lists.newArrayList();
 
-    @Reference
+    @Reference(target = "(|(server.type=embedded)(server.type=remote))")
     private SolrServerProvider solrServerProvider;
 
     @Reference
@@ -64,7 +64,7 @@ public class SolrQueryIndexProviderService {
             policyOption = ReferencePolicyOption.GREEDY,
             policy = ReferencePolicy.DYNAMIC
     )
-    private NodeAggregator nodeAggregator;
+    private volatile NodeAggregator nodeAggregator;
 
     @Property(boolValue = QUERY_TIME_AGGREGATION_DEFAULT, label = "query time aggregation",
             description = "enable query time aggregation for Solr index")

@@ -174,7 +174,7 @@ public abstract class OakFixture {
                             setMongoDB(mongo.getDB()).
                             memoryCacheSize(cacheSize).
                             setPersistentCache("target/persistentCache,time").
-                            setClusterId(i).
+                            setClusterId(i + 1).
                             setLogging(false);
                     setupBlobStore(mkBuilder);
                     kernels[i] = mkBuilder.open();
@@ -255,7 +255,7 @@ public abstract class OakFixture {
                     DataSource ds = RDBDataSourceFactory.forJdbcUrl(jdbcuri, jdbcuser, jdbcpasswd);
                     DocumentMK.Builder mkBuilder = new DocumentMK.Builder()
                             .setRDBConnection(ds, getOptions(dropDBAfterTest, tablePrefix)).memoryCacheSize(cacheSize)
-                            .setClusterId(i).setLogging(false);
+                            .setClusterId(i + 1).setLogging(false);
                     if (blobStore != null) {
                         mkBuilder.setBlobStore(blobStore);
                     }

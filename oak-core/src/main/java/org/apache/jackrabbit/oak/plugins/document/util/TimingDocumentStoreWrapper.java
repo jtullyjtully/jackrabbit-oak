@@ -282,6 +282,18 @@ public class TimingDocumentStoreWrapper implements DocumentStore {
             throw convert(e);
         }
     }
+    
+    @Override
+    public CacheInvalidationStats invalidateCache(Iterable<String> keys) {
+        try {
+            long start = now();
+            CacheInvalidationStats result = base.invalidateCache(keys);
+            updateAndLogTimes("invalidateCache3", start, 0, 0);
+            return result;
+        } catch (Exception e) {
+            throw convert(e);
+        }
+    }
 
     @Override
     public <T extends Document> void invalidateCache(Collection<T> collection, String key) {
@@ -344,6 +356,18 @@ public class TimingDocumentStoreWrapper implements DocumentStore {
     @Override
     public Map<String, String> getMetadata() {
         return base.getMetadata();
+    }
+    
+    @Override
+    public long determineServerTimeDifferenceMillis() {
+        try {
+            long start = now();
+            long result = base.determineServerTimeDifferenceMillis();
+            updateAndLogTimes("determineServerTimeDifferenceMillis", start, 0, 0);
+            return result;
+        } catch (Exception e) {
+            throw convert(e);
+        }
     }
 
     private void logCommonCall(long start, String key) {

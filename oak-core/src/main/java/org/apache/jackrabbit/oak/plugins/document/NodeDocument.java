@@ -23,7 +23,9 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.NavigableMap;
 import java.util.Queue;
+import java.util.Set;
 import java.util.SortedMap;
+import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -51,11 +53,15 @@ import org.slf4j.LoggerFactory;
 
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.collect.Iterables.concat;
 import static com.google.common.collect.Iterables.filter;
 import static com.google.common.collect.Iterables.transform;
 import static org.apache.jackrabbit.oak.plugins.document.Collection.NODES;
+import static org.apache.jackrabbit.oak.plugins.document.StableRevisionComparator.REVERSE;
 import static org.apache.jackrabbit.oak.plugins.document.UpdateOp.Key;
 import static org.apache.jackrabbit.oak.plugins.document.UpdateOp.Operation;
 import static org.apache.jackrabbit.oak.plugins.document.util.Utils.isRevisionNewer;
@@ -248,7 +254,7 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
      * into multiple types depending on the content i.e. weather it contains
      * REVISIONS, COMMIT_ROOT, property history etc
      */
-    public static enum SplitDocType {
+    public enum SplitDocType {
         /**
          * Not a split document
          */
@@ -294,7 +300,7 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
 
         final int type;
 
-        private SplitDocType(int type){
+        SplitDocType(int type){
             this.type = type;
         }
 
@@ -479,10 +485,7 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
 
     public boolean hasBinary() {
         Number flag = (Number) get(HAS_BINARY_FLAG);
-        if(flag == null){
-            return false;
-        }
-        return flag.intValue() == HAS_BINARY_VAL;
+        return flag != null && flag.intValue() == HAS_BINARY_VAL;
     }
 
     /**
@@ -671,15 +674,21 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
      * Get the revision of the latest change made to this node.
      *
      * @param context the revision context
+     * @param baseRev the base revision of the current change.
      * @param changeRev the revision of the current change
-     * @param handler the conflict handler, which is called for concurrent changes
-     *                preceding <code>changeRev</code>.
+     * @param branch the branch associated with the current change or
+     *              {@code null} if {@code changeRev} is not a branch commit.
+     * @param collisions concurrent changes preceding <code>changeRev</code>.
      * @return the revision, or null if deleted
      */
     @CheckForNull
-    public Revision getNewestRevision(final RevisionContext context,
-                                      final Revision changeRev,
-                                      final CollisionHandler handler) {
+    Revision getNewestRevision(final RevisionContext context,
+                               final Revision baseRev,
+                               final Revision changeRev,
+                               final Branch branch,
+                               final Set<Revision> collisions) {
+        checkArgument(!baseRev.isBranch() || branch != null,
+                "Branch must be non-null if baseRev is a branch revision");
         final Map<Revision, String> validRevisions = Maps.newHashMap();
         Predicate<Revision> predicate = new Predicate<Revision>() {
             @Override
@@ -690,15 +699,25 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
                 if (isValidRevision(context, input, null, changeRev, validRevisions)) {
                     return true;
                 }
-                handler.concurrentModification(input);
+                collisions.add(input);
                 return false;
             }
         };
 
         Revision newestRev = null;
+        int localClusterId = context.getClusterId();
         // check local commits first
         SortedMap<Revision, String> revisions = getLocalRevisions();
         SortedMap<Revision, String> commitRoots = getLocalCommitRoot();
+        // go through all local commits and consider all
+        // changes from another cluster node not yet visible from
+        // the base version as collision
+        for (Revision r : concat(revisions.keySet(), commitRoots.keySet())) {
+            if (r.getClusterId() != localClusterId
+                    && isRevisionNewer(context, r, baseRev)) {
+                collisions.add(r);
+            }
+        }
         Iterator<Revision> it = filter(Iterables.mergeSorted(
                 ImmutableList.of(revisions.keySet(), commitRoots.keySet()),
                 revisions.comparator()), predicate).iterator();
@@ -706,9 +725,12 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
             newestRev = it.next();
         } else {
             // check full history (only needed in rare cases)
-            it = filter(Iterables.mergeSorted(
-                    ImmutableList.of(getValueMap(REVISIONS).keySet(), getValueMap(COMMIT_ROOT).keySet()),
-                    revisions.comparator()), predicate).iterator();
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("getNewestRevision() with changeRev {} on {}, " +
+                                "_revisions {}, _commitRoot {}",
+                        changeRev, getId(), getLocalRevisions(), getLocalCommitRoot());
+            }
+            it = filter(getAllChanges(), predicate).iterator();
             if (it.hasNext()) {
                 newestRev = it.next();
             }
@@ -977,7 +999,7 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
                 continue;
             }
             // was this property touched after baseRevision?
-            for (Revision rev : getValueMap(name).keySet()) {
+            for (Revision rev : getChanges(name, baseRevision, context)) {
                 if (rev.equals(commitRevision)) {
                     continue;
                 }
@@ -1040,14 +1062,21 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
 
     /**
      * Returns update operations to split this document. The implementation may
-     * decide to not return any operations if no splitting is required.
+     * decide to not return any operations if no splitting is required. A caller
+     * must explicitly pass a head revision even though it is available through
+     * the {@link RevisionContext}. The given head revision must reflect a head
+     * state before {@code doc} was retrieved from the document store. This is
+     * important in order to maintain consistency. See OAK-3081 for details.
      *
      * @param context the revision context.
+     * @param head    the head revision before this document was retrieved from
+     *                the document store.
      * @return the split operations.
      */
     @Nonnull
-    public Iterable<UpdateOp> split(@Nonnull RevisionContext context) {
-        return SplitOperations.forDocument(this, context);
+    public Iterable<UpdateOp> split(@Nonnull RevisionContext context,
+                                    @Nonnull Revision head) {
+        return SplitOperations.forDocument(this, context, head, NUM_REVS_THRESHOLD);
     }
 
     /**
@@ -1101,8 +1130,8 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
             if (!includeStale) {
                 stale = getLocalMap(STALE_PREV);
             }
-            NavigableMap<Revision, Range> transformed = new TreeMap<Revision, Range>(
-                    StableRevisionComparator.REVERSE);
+            NavigableMap<Revision, Range> transformed =
+                    new TreeMap<Revision, Range>(REVERSE);
             for (Map.Entry<Revision, String> entry : map.entrySet()) {
                 Range r = Range.fromEntry(entry.getKey(), entry.getValue());
                 if (String.valueOf(r.height).equals(stale.get(r.high))) {
@@ -1174,6 +1203,7 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
     NodeDocument getPreviousDocument(String prevId){
         //Use the maxAge variant such that in case of Mongo call for
         //previous doc are directed towards replicas first
+        LOG.trace("get previous document {}", prevId);
         return store.find(Collection.NODES, prevId, Integer.MAX_VALUE);
     }
 
@@ -1203,6 +1233,53 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
         };
     }
 
+    /**
+     * Returns previous leaf documents. Those are the previous documents with
+     * a type {@code !=} {@link SplitDocType#INTERMEDIATE}. The documents are
+     * returned in descending order based on the most recent change recorded
+     * in the previous document. A change is defined as an entry in either the
+     * {@link #REVISIONS} or {@link #COMMIT_ROOT} map.
+     *
+     * @return the leaf documents in descending order.
+     */
+    @Nonnull
+    Iterator<NodeDocument> getPreviousDocLeaves() {
+        if (getPreviousRanges().isEmpty()) {
+            return Iterators.emptyIterator();
+        }
+        // create a mutable copy
+        final NavigableMap<Revision, Range> ranges = Maps.newTreeMap(getPreviousRanges());
+        return new AbstractIterator<NodeDocument>() {
+            @Override
+            protected NodeDocument computeNext() {
+                NodeDocument next;
+                for (;;) {
+                    Map.Entry<Revision, Range> topEntry = ranges.pollFirstEntry();
+                    if (topEntry == null) {
+                        // no more ranges
+                        next = endOfData();
+                        break;
+                    }
+                    NodeDocument prev = getPreviousDoc(topEntry.getKey(), topEntry.getValue());
+                    if (prev == null) {
+                        // move on to next range
+                        continue;
+                    }
+                    if (topEntry.getValue().getHeight() == 0) {
+                        // this is a leaf
+                        next = prev;
+                        break;
+                    } else {
+                        // replace intermediate entry with its previous ranges
+                        ranges.putAll(prev.getPreviousRanges());
+                    }
+                }
+                return next;
+            }
+        };
+    }
+
+    @CheckForNull
     private NodeDocument getPreviousDoc(Revision rev, Range range){
         int h = range.height;
         String prevId = Utils.getPreviousIdFor(getMainPath(), rev, h);
@@ -1247,6 +1324,149 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
             }
         }
         return null;
+    }
+
+    /**
+     * Returns an {@link Iterable} of {@link Revision} of all changes performed
+     * on this document. This covers all entries for {@link #REVISIONS} and
+     * {@link #COMMIT_ROOT} including previous documents. The revisions are
+     * returned in descending stable revision order using
+     * {@link StableRevisionComparator#REVERSE}.
+     *
+     * @return revisions of all changes performed on this document.
+     */
+    Iterable<Revision> getAllChanges() {
+        final SortedSet<Revision> stack = Sets.newTreeSet(REVERSE);
+        // initialize with local revisions and commitRoot entries
+        stack.addAll(getLocalCommitRoot().keySet());
+        stack.addAll(getLocalRevisions().keySet());
+        if (getPreviousRanges().isEmpty()) {
+            return stack;
+        }
+        return new Iterable<Revision>() {
+            @Override
+            public Iterator<Revision> iterator() {
+                final Iterator<NodeDocument> previousDocs = getPreviousDocLeaves();
+                return new AbstractIterator<Revision>() {
+                    private NodeDocument nextDoc;
+                    private Revision nextRevision;
+                    @Override
+                    protected Revision computeNext() {
+                        if (stack.isEmpty()) {
+                            return endOfData();
+                        }
+                        Revision next = stack.first();
+                        stack.remove(next);
+                        fillStackIfNeeded();
+                        return next;
+                    }
+
+                    private void fillStackIfNeeded() {
+                        for (;;) {
+                            fetchNextDoc();
+
+                            // no more changes to compare with
+                            if (nextDoc == null) {
+                                return;
+                            }
+
+                            // check if current top revision is still newer than
+                            // most recent revision of next document
+                            if (!stack.isEmpty()) {
+                                Revision top = stack.first();
+                                if (top.compareRevisionTimeThenClusterId(nextRevision) > 0) {
+                                    return;
+                                }
+                            }
+
+                            // if we get here, we need to pull in changes
+                            // from nextDoc
+                            Iterables.addAll(stack, nextDoc.getAllChanges());
+                            nextDoc = null;
+                            nextRevision = null;
+                        }
+                    }
+
+                    /**
+                     * Fetch the next document if {@code nextDoc} is
+                     * {@code null} and there are more documents.
+                     */
+                    private void fetchNextDoc() {
+                        for (;;) {
+                            if (nextDoc != null) {
+                                break;
+                            }
+                            if (!previousDocs.hasNext()) {
+                                // no more previous docs
+                                break;
+                            }
+                            nextDoc = previousDocs.next();
+                            Iterator<Revision> changes = nextDoc.getAllChanges().iterator();
+                            if (changes.hasNext()) {
+                                nextRevision = changes.next();
+                                break;
+                            } else {
+                                // empty document, try next
+                                nextDoc = null;
+                            }
+                        }
+                    }
+                };
+            }
+        };
+    }
+
+    /**
+     * Returns all changes for the given property back to {@code min} revision
+     * (exclusive). The revisions include committed as well as uncommitted
+     * changes.
+     *
+     * @param property the name of the property.
+     * @param min the lower bound revision (exclusive).
+     * @param context the revision context.
+     * @return changes back to {@code min} revision.
+     */
+    @Nonnull
+    Iterable<Revision> getChanges(@Nonnull final String property,
+                                  @Nonnull final Revision min,
+                                  @Nonnull final RevisionContext context) {
+        return new Iterable<Revision>() {
+            @Override
+            public Iterator<Revision> iterator() {
+                final Set<Revision> changes = getValueMap(property).keySet();
+                final Set<Integer> clusterIds = Sets.newHashSet();
+                for (Revision r : getLocalMap(property).keySet()) {
+                    clusterIds.add(r.getClusterId());
+                }
+                for (Range r : getPreviousRanges().values()) {
+                    if (isRevisionNewer(context, r.high, min)) {
+                        clusterIds.add(r.high.getClusterId());
+                    }
+                }
+                final Iterator<Revision> unfiltered = changes.iterator();
+                return new AbstractIterator<Revision>() {
+                    @Override
+                    protected Revision computeNext() {
+                        while (unfiltered.hasNext()) {
+                            Revision next = unfiltered.next();
+                            if (isRevisionNewer(context, next, min)) {
+                                return next;
+                            } else {
+                                // further revisions with this clusterId
+                                // are older than min revision
+                                clusterIds.remove(next.getClusterId());
+                                // no more revisions to check
+                                if (clusterIds.isEmpty()) {
+                                    return endOfData();
+                                }
+                            }
+                        }
+                        return endOfData();
+                    }
+                };
+            }
+        };
+
     }
 
     /**
@@ -1692,8 +1912,8 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
     }
     
     @SuppressWarnings("unchecked")
-    private static void toJson(JsopWriter json, Map<? extends Object, Object> map) {
-        for (Entry<? extends Object, Object>e : map.entrySet()) {
+    private static void toJson(JsopWriter json, Map<?, Object> map) {
+        for (Entry<?, Object>e : map.entrySet()) {
             json.key(e.getKey().toString());
             Object value = e.getValue();
             if (value == null) {
@@ -1747,7 +1967,7 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
         case JsopReader.STRING:
             return json.getToken();
         case '{':
-            TreeMap<Revision, Object> map = new TreeMap<Revision, Object>(StableRevisionComparator.REVERSE);
+            TreeMap<Revision, Object> map = new TreeMap<Revision, Object>(REVERSE);
             while (true) {
                 if (json.matches('}')) {
                     break;

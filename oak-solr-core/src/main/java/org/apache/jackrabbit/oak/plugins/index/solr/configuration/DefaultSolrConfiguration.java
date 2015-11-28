@@ -122,4 +122,20 @@ public class DefaultSolrConfiguration implements OakSolrConfiguration {
         return usedProperties;
     }
 
+    @Override
+    public boolean collapseJcrContentNodes() {
+        return SolrServerConfigurationDefaults.COLLAPSE_JCR_CONTENT_NODES;
+    }
+
+    @Nonnull
+    @Override
+    public String getCollapsedPathField() {
+        return SolrServerConfigurationDefaults.COLLAPSED_PATH_FIELD;
+    }
+
+    @Override
+    public String getPathDepthField() {
+        return SolrServerConfigurationDefaults.PATH_DEPTH_FIELD;
+    }
+
 }

@@ -198,6 +198,26 @@ public class LockManagerImpl implements LockManager {
         });
     }
 
+    /**
+     * Verifies if the current <tt>sessionContext</tt> can unlock the specified <tt>node</tt>
+     * 
+     * @param node the node state to check
+     * 
+     * @return true if the current <tt>sessionContext</tt> can unlock the specified <tt>node</tt>
+     */
+    public boolean canUnlock(NodeDelegate node) {
+        String path = node.getPath();
+        if (sessionContext.getSessionScopedLocks().contains(path)
+                || sessionContext.getOpenScopedLocks().contains(path)) {
+            return true;
+        } else if (sessionContext.getAttributes().get(RELAXED_LOCKING) == TRUE) {
+            String user = sessionContext.getSessionDelegate().getAuthInfo().getUserID();
+            return node.isLockOwner(user) || isAdmin(sessionContext, user);
+        } else {
+            return false;
+        }
+    }
+
     private boolean isAdmin(SessionContext sessionContext, String user) {
         try {
             Authorizable a = sessionContext.getUserManager().getAuthorizable(

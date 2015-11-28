@@ -60,6 +60,12 @@ public class OakSolrConfigurationProviderService implements OakSolrConfiguration
     @Property(value = SolrServerConfigurationDefaults.CATCHALL_FIELD, label = "catch all field")
     private static final String CATCH_ALL_FIELD = "catch.all.field";
 
+    @Property(value = SolrServerConfigurationDefaults.COLLAPSED_PATH_FIELD, label = "field for collapsing jcr:content paths")
+    private static final String COLLAPSED_PATH_FIELD = "collapsed.path.field";
+
+    @Property(value = SolrServerConfigurationDefaults.PATH_DEPTH_FIELD, label = "field for path depth")
+    private static final String PATH_DEPTH_FIELD = "path.depth.field";
+
     @Property(options = {
             @PropertyOption(name = "HARD",
                     value = "Hard commit"
@@ -73,7 +79,6 @@ public class OakSolrConfigurationProviderService implements OakSolrConfiguration
             value = "SOFT"
     )
     private static final String COMMIT_POLICY = "commit.policy";
-
 
     @Property(intValue = SolrServerConfigurationDefaults.ROWS, label = "rows")
     private static final String ROWS = "rows";
@@ -104,10 +109,14 @@ public class OakSolrConfigurationProviderService implements OakSolrConfiguration
             "mappings from JCR property names to Solr fields")
     private static final String PROPERTY_MAPPINGS = "property.mappings";
 
+    @Property(boolValue = SolrServerConfigurationDefaults.COLLAPSE_JCR_CONTENT_NODES, label = "collapse jcr:content nodes")
+    private static final String COLLAPSE_JCR_CONTENT_NODES = "collapse.jcrcontent.nodes";
+
     private String pathChildrenFieldName;
     private String pathParentFieldName;
     private String pathDescendantsFieldName;
     private String pathExactFieldName;
+    private String collapsedPathField;
     private String catchAllField;
     private OakSolrConfiguration.CommitPolicy commitPolicy;
     private int rows;
@@ -118,6 +127,8 @@ public class OakSolrConfigurationProviderService implements OakSolrConfiguration
     private String[] usedProperties;
     private String[] typeMappings;
     private String[] propertyMappings;
+    private boolean collapseJcrContentNodes;
+    private String depthField;
 
     private OakSolrConfiguration oakSolrConfiguration;
 
@@ -126,8 +137,10 @@ public class OakSolrConfigurationProviderService implements OakSolrConfiguration
         pathChildrenFieldName = String.valueOf(componentContext.getProperties().get(PATH_CHILDREN_FIELD));
         pathParentFieldName = String.valueOf(componentContext.getProperties().get(PATH_PARENT_FIELD));
         pathExactFieldName = String.valueOf(componentContext.getProperties().get(PATH_EXACT_FIELD));
+        collapsedPathField= String.valueOf(componentContext.getProperties().get(COLLAPSED_PATH_FIELD));
         pathDescendantsFieldName = String.valueOf(componentContext.getProperties().get(PATH_DESCENDANTS_FIELD));
         catchAllField = String.valueOf(componentContext.getProperties().get(CATCH_ALL_FIELD));
+        depthField = String.valueOf(componentContext.getProperties().get(PATH_DEPTH_FIELD));
         rows = Integer.parseInt(String.valueOf(componentContext.getProperties().get(ROWS)));
         commitPolicy = OakSolrConfiguration.CommitPolicy.valueOf(String.valueOf(componentContext.getProperties().get(COMMIT_POLICY)));
         useForPathRestrictions = Boolean.valueOf(String.valueOf(componentContext.getProperties().get(PATH_RESTRICTIONS)));
@@ -137,6 +150,7 @@ public class OakSolrConfigurationProviderService implements OakSolrConfiguration
         ignoredProperties = PropertiesUtil.toStringArray(componentContext.getProperties().get(IGNORED_PROPERTIES));
         usedProperties = PropertiesUtil.toStringArray(componentContext.getProperties().get(USED_PROPERTIES));
         propertyMappings = PropertiesUtil.toStringArray(componentContext.getProperties().get(PROPERTY_MAPPINGS));
+        collapseJcrContentNodes = Boolean.valueOf(String.valueOf(componentContext.getProperties().get(COLLAPSE_JCR_CONTENT_NODES)));
     }
 
     @Deactivate
@@ -262,6 +276,22 @@ public class OakSolrConfigurationProviderService implements OakSolrConfiguration
                     } else {
                         return Collections.emptyList();
                     }
+                }
+
+                @Override
+                public boolean collapseJcrContentNodes() {
+                    return collapseJcrContentNodes;
+                }
+
+                @Nonnull
+                @Override
+                public String getCollapsedPathField() {
+                    return collapsedPathField;
+                }
+
+                @Override
+                public String getPathDepthField() {
+                    return depthField;
                 }
             };
         }

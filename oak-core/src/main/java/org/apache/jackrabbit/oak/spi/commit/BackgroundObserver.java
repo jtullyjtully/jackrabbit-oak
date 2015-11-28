@@ -226,7 +226,7 @@ public class BackgroundObserver implements Observer, Closeable {
             public int getLocalEventCount() {
                 return size(filter(queue, new Predicate<ContentChange>() {
                     @Override
-                    public boolean apply(ContentChange input) {
+                    public boolean apply(@Nullable ContentChange input) {
                         return input.info != null;
                     }
                 }));
@@ -236,7 +236,7 @@ public class BackgroundObserver implements Observer, Closeable {
             public int getExternalEventCount() {
                 return size(filter(queue, new Predicate<ContentChange>() {
                     @Override
-                    public boolean apply(ContentChange input) {
+                    public boolean apply(@Nullable ContentChange input) {
                         return input.info == null;
                     }
                 }));

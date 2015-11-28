@@ -27,6 +27,7 @@ import javax.jcr.Repository;
 import javax.jcr.RepositoryException;
 import javax.jcr.Session;
 import javax.security.auth.Subject;
+import javax.security.auth.login.LoginException;
 
 import org.apache.jackrabbit.api.JackrabbitRepository;
 import org.apache.jackrabbit.api.JackrabbitSession;
@@ -45,8 +46,8 @@ import org.apache.jackrabbit.oak.spi.security.authentication.external.SyncHandle
 import org.apache.jackrabbit.oak.spi.security.authentication.external.SyncManager;
 import org.apache.jackrabbit.oak.spi.security.authentication.external.SyncResult;
 import org.apache.jackrabbit.oak.spi.security.authentication.external.SyncedIdentity;
-import org.apache.jackrabbit.oak.spi.security.authentication.external.impl.SyncResultImpl;
-import org.apache.jackrabbit.oak.spi.security.authentication.external.impl.SyncedIdentityImpl;
+import org.apache.jackrabbit.oak.spi.security.authentication.external.basic.DefaultSyncResultImpl;
+import org.apache.jackrabbit.oak.spi.security.authentication.external.basic.DefaultSyncedIdentity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,6 +56,9 @@ import org.slf4j.LoggerFactory;
  */
 public class SyncMBeanImpl implements SynchronizationMBean {
 
+    /**
+     * default logger
+     */
     private static final Logger log = LoggerFactory.getLogger(SyncMBeanImpl.class);
 
     private final Repository repository;
@@ -95,7 +99,7 @@ public class SyncMBeanImpl implements SynchronizationMBean {
         }
     }
 
-    private final class Delegatee {
+    private class Delegatee {
 
         private SyncHandler handler;
 
@@ -107,13 +111,13 @@ public class SyncMBeanImpl implements SynchronizationMBean {
 
         private Session systemSession;
 
-        private Delegatee(@Nonnull SyncHandler handler, @Nonnull ExternalIdentityProvider idp) throws SyncException {
+        private Delegatee(SyncHandler handler, ExternalIdentityProvider idp) throws SyncException {
             this.handler = handler;
             this.idp = idp;
             try {
                 systemSession = Subject.doAs(SystemSubject.INSTANCE, new PrivilegedExceptionAction<Session>() {
                     @Override
-                    public Session run() throws RepositoryException {
+                    public Session run() throws LoginException, RepositoryException {
                         if (repository instanceof JackrabbitRepository) {
                             // this is to bypass GuestCredentials injection in the "AbstractSlingRepository2"
                             return ((JackrabbitRepository) repository).login(null, null, null);
@@ -159,9 +163,7 @@ public class SyncMBeanImpl implements SynchronizationMBean {
                     SyncResult r = context.sync(userId);
                     systemSession.save();
                     result.add(getJSONString(r));
-                } catch (SyncException e) {
-                    log.warn("Error while syncing user {}", userId, e);
-                } catch (RepositoryException e) {
+                } catch (Exception e) {
                     log.warn("Error while syncing user {}", userId, e);
                 }
             }
@@ -186,9 +188,8 @@ public class SyncMBeanImpl implements SynchronizationMBean {
                             SyncResult r = context.sync(id.getId());
                             systemSession.save();
                             list.add(getJSONString(r));
-                        } catch (SyncException e) {
-                            list.add(getJSONString(id, e));
-                        } catch (RepositoryException e) {
+                        } catch (Exception e) {
+                            log.error("Error while syncing user {}", id, e);
                             list.add(getJSONString(id, e));
                         }
                     }
@@ -215,8 +216,8 @@ public class SyncMBeanImpl implements SynchronizationMBean {
                         systemSession.save();
                         list.add(getJSONString(r));
                     } else {
-                        SyncResult r = new SyncResultImpl(
-                                new SyncedIdentityImpl("", ref, false, -1),
+                        SyncResult r = new DefaultSyncResultImpl(
+                                new DefaultSyncedIdentity("", ref, false, -1),
                                 SyncResult.Status.NO_SUCH_IDENTITY
                         );
                         list.add(getJSONString(r));
@@ -224,9 +225,8 @@ public class SyncMBeanImpl implements SynchronizationMBean {
                 } catch (ExternalIdentityException e) {
                     log.warn("error while fetching the external identity {}", externalId, e);
                     list.add(getJSONString(ref, e));
-                } catch (SyncException e) {
-                    list.add(getJSONString(ref, e));
-                } catch (RepositoryException e) {
+                } catch (Exception e) {
+                    log.error("Error while syncing user {}", ref, e);
                     list.add(getJSONString(ref, e));
                 }
             }
@@ -247,10 +247,18 @@ public class SyncMBeanImpl implements SynchronizationMBean {
                     try {
                         SyncResult r = context.sync(user);
                         systemSession.save();
+                        if (r.getIdentity() == null) {
+                            r = new DefaultSyncResultImpl(
+                                    new DefaultSyncedIdentity(user.getId(), user.getExternalId(), false, -1),
+                                    SyncResult.Status.NO_SUCH_IDENTITY
+                            );
+                            log.warn("sync failed. {}", r.getIdentity());
+                        } else {
+                            log.info("synced {}", r.getIdentity());
+                        }
                         list.add(getJSONString(r));
-                    } catch (SyncException e) {
-                        list.add(getJSONString(user.getExternalId(), e));
-                    } catch (RepositoryException e) {
+                    } catch (Exception e) {
+                        log.error("Error while syncing user {}", user, e);
                         list.add(getJSONString(user.getExternalId(), e));
                     }
                 }
@@ -271,17 +279,19 @@ public class SyncMBeanImpl implements SynchronizationMBean {
                 while (iter.hasNext()) {
                     SyncedIdentity id = iter.next();
                     if (isMyIDP(id)) {
-                        ExternalIdentityRef exIdRef = id.getExternalIdRef();
-                        ExternalIdentity extId = (exIdRef == null) ? null : idp.getIdentity(exIdRef);
-                        if (extId == null) {
-                            list.add(id.getId());
+                        try {
+                            ExternalIdentityRef ref = id.getExternalIdRef();
+                            ExternalIdentity extId = ref == null ? null : idp.getIdentity(ref);
+                            if (extId == null) {
+                                list.add(id.getId());
+                            }
+                        } catch (Exception e) {
+                            log.error("Error while fetching external identity {}", id, e);
                         }
                     }
                 }
             } catch (RepositoryException e) {
                 log.error("Error while listing orphaned users", e);
-            } catch (ExternalIdentityException e) {
-                log.error("Error while fetching external identity", e);
             }
             return list.toArray(new String[list.size()]);
         }
@@ -298,25 +308,23 @@ public class SyncMBeanImpl implements SynchronizationMBean {
                     SyncResult r = context.sync(userId);
                     systemSession.save();
                     result.add(getJSONString(r));
-                } catch (SyncException e) {
-                    log.warn("Error while syncing user {}", userId, e);
-                } catch (RepositoryException e) {
+                } catch (Exception e) {
                     log.warn("Error while syncing user {}", userId, e);
                 }
             }
             return result.toArray(new String[result.size()]);
         }
 
-        private boolean isMyIDP(@Nonnull SyncedIdentity id) {
-            String providerName = id.getExternalIdRef() == null
+        private boolean isMyIDP(SyncedIdentity id) {
+            String idpName = id.getExternalIdRef() == null
                     ? null
                     : id.getExternalIdRef().getProviderName();
-            return (providerName == null || providerName.isEmpty() || providerName.equals(idp.getName()));
+            return (idpName == null || idpName.length() ==0 || idpName.equals(idp.getName()));
         }
     }
 
-    private static String getJSONString(@Nonnull SyncResult r) {
-        String op;
+    private static String getJSONString(SyncResult r) {
+        String op = "";
         switch (r.getStatus()) {
             case NOP:
                 op = "nop";
@@ -342,19 +350,19 @@ public class SyncMBeanImpl implements SynchronizationMBean {
             case FOREIGN:
                 op = "for";
                 break;
-            default:
-                op = "";
         }
-        SyncedIdentity syncedIdentity = r.getIdentity();
-        String uid = JsonUtil.getJsonString((syncedIdentity == null ? null : syncedIdentity.getId()));
-        ExternalIdentityRef externalIdentityRef = (syncedIdentity == null) ? null : syncedIdentity.getExternalIdRef();
-        String eid = (externalIdentityRef == null) ? "\"\"" : JsonUtil.getJsonString(externalIdentityRef.getString());
+        String uid = JsonUtil.getJsonString(r.getIdentity().getId());
+        String eid = r.getIdentity().getExternalIdRef() == null
+                ? "\"\""
+                : JsonUtil.getJsonString(r.getIdentity().getExternalIdRef().getString());
         return String.format("{op:\"%s\",uid:%s,eid:%s}", op, uid, eid);
     }
 
-    private static String getJSONString(@Nonnull SyncedIdentity id, @Nonnull Exception e) {
+    private static String getJSONString(SyncedIdentity id, Exception e) {
         String uid = JsonUtil.getJsonString(id.getId());
-        String eid = (id.getExternalIdRef() == null) ? "\"\"" : JsonUtil.getJsonString(id.getExternalIdRef().getString());
+        String eid = id.getExternalIdRef() == null
+                ? "\"\""
+                : JsonUtil.getJsonString(id.getExternalIdRef().getString());
         String msg = JsonUtil.getJsonString(e.toString());
         return String.format("{op:\"ERR\",uid:%s,eid:%s,msg:%s}", uid, eid, msg);
     }

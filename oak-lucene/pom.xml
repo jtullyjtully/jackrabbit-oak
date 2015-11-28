@@ -23,7 +23,7 @@
   <parent>
     <groupId>org.apache.jackrabbit</groupId>
     <artifactId>oak-parent</artifactId>
-    <version>1.4-SNAPSHOT</version>
+    <version>1.2.9-SNAPSHOT</version>
     <relativePath>../oak-parent/pom.xml</relativePath>
   </parent>
 
@@ -42,7 +42,11 @@
       org.apache.jackrabbit.core.query.ExcerptTest#testPunctuationStartsFragment                     <!-- OAK-318 -->
       org.apache.jackrabbit.core.query.ExcerptTest#testPunctuationStartsFragmentEndsWithDots         <!-- OAK-318 -->
       org.apache.jackrabbit.core.query.ExcerptTest#testPreferPhrase                                  <!-- OAK-318 -->
+      org.apache.jackrabbit.core.query.ExcerptTest#testQuotedPhrase                                  <!-- OAK-3580 -->
+      org.apache.jackrabbit.core.query.ExcerptTest#testHighlightJa                                   <!-- OAK-3580 -->
+      org.apache.jackrabbit.core.query.ExcerptTest#testEncodeIllegalCharsHighlights                  <!-- OAK-3580 -->
       org.apache.jackrabbit.core.query.QueryResultTest#testSkip                                      <!-- OAK-484 -->
+      org.apache.jackrabbit.core.query.QueryResultTest#testGetSize                                   <!-- OAK-2689 -->
       org.apache.jackrabbit.core.query.DerefTest#testDeref                                           <!-- OAK-321 -->
       org.apache.jackrabbit.core.query.DerefTest#testDerefInPredicate                                <!-- OAK-321 -->
       org.apache.jackrabbit.core.query.DerefTest#testRewrite                                         <!-- OAK-321 -->
@@ -116,10 +120,14 @@
             <Import-Package>
                 org.apache.lucene.sandbox.*;resolution:=optional,
                 !org.apache.lucene.*,
+                !org.apache.jackrabbit.oak.cache,
                 *
             </Import-Package>
             <Embed-Dependency>
-                lucene-*;inline=true
+                lucene-*;inline=true,
+              <!-- TODO FIXME OAK-3598 -->
+              oak-core;inline="org/apache/jackrabbit/oak/cache/CacheStats*"
+              <!-- TODO FIXME OAK-3598 -->
             </Embed-Dependency>
           </instructions>
         </configuration>
@@ -206,6 +214,16 @@
       <version>${lucene.version}</version>
       <scope>provided</scope>
     </dependency>
+    <dependency>
+      <groupId>org.apache.lucene</groupId>
+      <artifactId>lucene-highlighter</artifactId>
+      <version>${lucene.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.lucene</groupId>
+      <artifactId>lucene-memory</artifactId>
+      <version>${lucene.version}</version>
+    </dependency>
 
     <!-- Logging -->
     <dependency>
@@ -221,8 +239,18 @@
 
     <!-- Test Dependencies -->
     <dependency>
+      <groupId>ch.qos.logback</groupId>
+      <artifactId>logback-classic</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>junit</groupId>
       <artifactId>junit</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mongodb</groupId>
+      <artifactId>mongo-java-driver</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -247,6 +275,13 @@
     </dependency>
     <dependency>
       <groupId>org.apache.jackrabbit</groupId>
+      <artifactId>oak-commons</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.jackrabbit</groupId>
       <artifactId>jackrabbit-jcr-tests</artifactId>
       <version>${jackrabbit.version}</version>
       <scope>test</scope>
@@ -257,11 +292,6 @@
       <version>${jackrabbit.version}</version>
       <classifier>tests</classifier>
       <scope>test</scope>
-    </dependency>
-    <dependency>
-        <groupId>ch.qos.logback</groupId>
-        <artifactId>logback-classic</artifactId>
-        <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.apache.tika</groupId>

@@ -17,22 +17,22 @@
 package org.apache.jackrabbit.oak.plugins.document;
 
 /**
- * <code>CollisionHandler</code>...
+ * Stats about background write operations.
  */
-abstract class CollisionHandler {
+class BackgroundWriteStats {
 
-    static final CollisionHandler DEFAULT = new CollisionHandler() {
-        @Override
-        void concurrentModification(Revision other) {
-            // do nothing
-        }
-    };
+    long clean;
+    long split;
+    long lock;
+    long write;
+    long num;
 
-    /**
-     * Callback for an concurrent modification in {@link Revision}
-     * <code>other</code>.
-     *
-     * @param other the revision of the concurrent change.
-     */
-    abstract void concurrentModification(Revision other);
+    @Override
+    public String toString() {
+        return "clean:" + clean +
+                ", split:" + split+
+                ", lock:" + lock +
+                ", write:" + write +
+                ", num:" + num;
+    }
 }

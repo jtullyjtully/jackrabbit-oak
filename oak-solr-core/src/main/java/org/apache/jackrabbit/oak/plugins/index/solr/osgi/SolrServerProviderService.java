@@ -51,7 +51,7 @@ import org.slf4j.LoggerFactory;
                 policy = ReferencePolicy.DYNAMIC,
                 bind = "bindSolrServerConfigurationProvider",
                 unbind = "unbindSolrServerConfigurationProvider",
-                updated = "updateSolrServerConfigurationProvider"
+                updated = "updatedSolrServerConfigurationProvider"
         )
 })
 @Service(SolrServerProvider.class)
@@ -78,8 +78,6 @@ public class SolrServerProviderService implements SolrServerProvider {
     private String serverType;
 
     private SolrServer cachedSolrServer;
-    private SolrServer cachedSearchingSolrServer;
-    private SolrServer cachedIndexingSolrServer;
 
     @Activate
     protected void activate(ComponentContext context) throws Exception {

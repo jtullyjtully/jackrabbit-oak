@@ -16,6 +16,8 @@
  */
 package org.apache.jackrabbit.oak.security.authentication.ldap.impl;
 
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -28,9 +30,11 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import javax.jcr.Credentials;
 import javax.jcr.SimpleCredentials;
+import javax.net.ssl.SSLContext;
 import javax.security.auth.login.LoginException;
 
 import org.apache.commons.pool.impl.GenericObjectPool;
+import org.apache.directory.api.ldap.codec.controls.search.pagedSearch.PagedResultsDecorator;
 import org.apache.directory.api.ldap.model.constants.SchemaConstants;
 import org.apache.directory.api.ldap.model.cursor.CursorException;
 import org.apache.directory.api.ldap.model.cursor.SearchCursor;
@@ -41,10 +45,13 @@ import org.apache.directory.api.ldap.model.exception.LdapAuthenticationException
 import org.apache.directory.api.ldap.model.exception.LdapException;
 import org.apache.directory.api.ldap.model.exception.LdapInvalidAttributeValueException;
 import org.apache.directory.api.ldap.model.message.Response;
+import org.apache.directory.api.ldap.model.message.ResultCodeEnum;
 import org.apache.directory.api.ldap.model.message.SearchRequest;
 import org.apache.directory.api.ldap.model.message.SearchRequestImpl;
+import org.apache.directory.api.ldap.model.message.SearchResultDone;
 import org.apache.directory.api.ldap.model.message.SearchResultEntry;
 import org.apache.directory.api.ldap.model.message.SearchScope;
+import org.apache.directory.api.ldap.model.message.controls.PagedResults;
 import org.apache.directory.api.ldap.model.name.Dn;
 import org.apache.directory.api.ldap.model.name.Rdn;
 import org.apache.directory.ldap.client.api.AbstractPoolableLdapConnectionFactory;
@@ -61,7 +68,6 @@ import org.apache.felix.scr.annotations.ConfigurationPolicy;
 import org.apache.felix.scr.annotations.Deactivate;
 import org.apache.felix.scr.annotations.Service;
 import org.apache.jackrabbit.commons.iterator.AbstractLazyIterator;
-import org.apache.jackrabbit.oak.commons.DebugTimer;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
 import org.apache.jackrabbit.oak.spi.security.authentication.external.ExternalGroup;
 import org.apache.jackrabbit.oak.spi.security.authentication.external.ExternalIdentity;
@@ -116,6 +122,10 @@ public class LdapIdentityProvider implements ExternalIdentityProvider {
      */
     private PoolableUnboundConnectionFactory userConnectionFactory;
 
+    /**
+     * SSL protocols (initialized on init)
+     */
+    private String[] enabledSSLProtocols;
 
     /**
      * Default constructor for OSGi
@@ -453,9 +463,13 @@ public class LdapIdentityProvider implements ExternalIdentityProvider {
             Entry entry = connection.lookup(ref.getId());
             timer.mark("lookup");
             Attribute attr = entry.get(config.getGroupMemberAttribute());
-            for (Value value: attr) {
-                ExternalIdentityRef memberRef = new ExternalIdentityRef(value.getString(), this.getName());
-                members.put(memberRef.getId(), memberRef);
+            if (attr == null) {
+                log.warn("LDAP group does not have configured attribute: {}", config.getGroupMemberAttribute());
+            } else {
+                for (Value value: attr) {
+                    ExternalIdentityRef memberRef = new ExternalIdentityRef(value.getString(), this.getName());
+                    members.put(memberRef.getId(), memberRef);
+                }
             }
             timer.mark("iterate");
             if (log.isDebugEnabled()) {
@@ -478,6 +492,15 @@ public class LdapIdentityProvider implements ExternalIdentityProvider {
     private void init() {
         if (adminConnectionFactory != null) {
             throw new IllegalStateException("Provider already initialized.");
+        }
+
+        // make sure the JVM supports the TLSv1.1
+        try {
+            enabledSSLProtocols = null;
+            SSLContext.getInstance("TLSv1.1");
+        } catch (NoSuchAlgorithmException e) {
+            log.warn("JDK does not support TLSv1.1. Disabling it.");
+            enabledSSLProtocols = new String[]{"TLSv1"};
         }
 
         // setup admin connection pool
@@ -535,6 +558,11 @@ public class LdapIdentityProvider implements ExternalIdentityProvider {
         if (config.noCertCheck()) {
             cc.setTrustManagers(new NoVerificationTrustManager());
         }
+
+        if (enabledSSLProtocols != null) {
+            cc.setEnabledProtocols(enabledSSLProtocols);
+        }
+
         return cc;
     }
 
@@ -606,36 +634,62 @@ public class LdapIdentityProvider implements ExternalIdentityProvider {
                 ? "(&" + filter + ')'
                 : filter.toString();
 
-        // Create the SearchRequest object
-        SearchRequest req = new SearchRequestImpl();
-        req.setScope(SearchScope.SUBTREE);
-        req.addAttributes(SchemaConstants.ALL_USER_ATTRIBUTES);
-        req.setTimeLimit((int) config.getSearchTimeout());
-        req.setBase(new Dn(idConfig.getBaseDN()));
-        req.setFilter(searchFilter);
+        // do paged searches (OAK-2874)
+        int pageSize = 1000;
+        byte[] cookie = null;
 
-        // Process the request
         List<Entry> result = new LinkedList<Entry>();
-        SearchCursor searchCursor = null;
-        try {
-            searchCursor = connection.search(req);
-            while (searchCursor.next()) {
-                Response response = searchCursor.get();
+        do {
 
-                // process the SearchResultEntry
-                if (response instanceof SearchResultEntry) {
-                    Entry resultEntry = ((SearchResultEntry) response).getEntry();
-                    result.add(resultEntry);
-                    if (log.isDebugEnabled()) {
-                        log.debug("search below {} with {} found {}", idConfig.getBaseDN(), searchFilter, resultEntry.getDn());
+            // Create the SearchRequest object
+            SearchRequest req = new SearchRequestImpl();
+            req.setScope(SearchScope.SUBTREE);
+            req.addAttributes(SchemaConstants.ALL_USER_ATTRIBUTES);
+            req.setTimeLimit((int) config.getSearchTimeout());
+            req.setBase(new Dn(idConfig.getBaseDN()));
+            req.setFilter(searchFilter);
+
+            PagedResults pagedSearchControl = new PagedResultsDecorator(connection.getCodecService());
+            pagedSearchControl.setSize(pageSize);
+            pagedSearchControl.setCookie(cookie);
+            req.addControl(pagedSearchControl);
+
+            // Process the request
+            SearchCursor searchCursor = null;
+            try {
+                searchCursor = connection.search(req);
+                while (searchCursor.next()) {
+                    Response response = searchCursor.get();
+
+                    // process the SearchResultEntry
+                    if (response instanceof SearchResultEntry) {
+                        Entry resultEntry = ((SearchResultEntry) response).getEntry();
+                        result.add(resultEntry);
+                        if (log.isDebugEnabled()) {
+                            log.debug("search below {} with {} found {}", idConfig.getBaseDN(), searchFilter, resultEntry.getDn());
+                        }
                     }
                 }
+
+                SearchResultDone done = searchCursor.getSearchResultDone();
+                cookie = null;
+                if (done.getLdapResult().getResultCode() == ResultCodeEnum.UNWILLING_TO_PERFORM) {
+                    break;
+                }
+
+                PagedResults ctrl = (PagedResults) done.getControl(PagedResults.OID);
+                if (ctrl != null) {
+                    cookie = ctrl.getCookie();
+                }
+
+            } finally {
+                if (searchCursor != null) {
+                    searchCursor.close();
+                }
             }
-        } finally {
-            if (searchCursor != null) {
-                searchCursor.close();
-            }
-        }
+
+        } while (cookie != null);
+
         if (log.isDebugEnabled()) {
             log.debug("search below {} with {} found {} entries.", idConfig.getBaseDN(), searchFilter, result.size());
         }
@@ -647,18 +701,20 @@ public class LdapIdentityProvider implements ExternalIdentityProvider {
             throws LdapInvalidAttributeValueException {
         ExternalIdentityRef ref = new ExternalIdentityRef(entry.getDn().getName(), this.getName());
         if (id == null) {
-            id = entry.get(config.getUserConfig().getIdAttribute()).getString();
+            String idAttribute = config.getUserConfig().getIdAttribute();
+            Attribute attr = entry.get(idAttribute);
+            if (attr == null) {
+                throw new LdapInvalidAttributeValueException(ResultCodeEnum.CONSTRAINT_VIOLATION,
+                        "no value found for attribute '" + idAttribute + "' for entry " + entry);
+            }
+            id = attr.getString();
         }
         String path = config.getUserConfig().makeDnPath()
                 ? createDNPath(entry.getDn())
                 : null;
         LdapUser user = new LdapUser(this, ref, id, path);
         Map<String, Object> props = user.getProperties();
-        for (Attribute attr: entry.getAttributes()) {
-            if (attr.isHumanReadable()) {
-                props.put(attr.getId(), attr.getString());
-            }
-        }
+        applyAttributes(props, entry);
         return user;
     }
 
@@ -667,20 +723,42 @@ public class LdapIdentityProvider implements ExternalIdentityProvider {
             throws LdapInvalidAttributeValueException {
         ExternalIdentityRef ref = new ExternalIdentityRef(entry.getDn().getName(), this.getName());
         if (name == null) {
-            name = entry.get(config.getGroupConfig().getIdAttribute()).getString();
+            String idAttribute = config.getGroupConfig().getIdAttribute();
+            Attribute attr = entry.get(idAttribute);
+            if (attr == null) {
+                throw new LdapInvalidAttributeValueException(ResultCodeEnum.CONSTRAINT_VIOLATION,
+                        "no value found for attribute '" + idAttribute + "' for entry " + entry);
+            }
+            name = attr.getString();
         }
         String path = config.getGroupConfig().makeDnPath()
                 ? createDNPath(entry.getDn())
                 : null;
         LdapGroup group = new LdapGroup(this, ref, name, path);
         Map<String, Object> props = group.getProperties();
-        for (Attribute attr: entry.getAttributes()) {
-            if (attr.isHumanReadable()) {
-                props.put(attr.getId(), attr.getString());
-            }
-        }
+        applyAttributes(props, entry);
         return group;
 
+    }
+
+    private void applyAttributes(Map<String, Object> props, Entry entry)
+            throws LdapInvalidAttributeValueException {
+        for (Attribute attr: entry.getAttributes()) {
+            if (attr.isHumanReadable()) {
+                final Object propValue;
+                // for multivalue properties, store as collection
+                if (attr.size() > 1) {
+                    List<String> values = new ArrayList<String>();
+                    for (Value<?> value : attr) {
+                        values.add(value.getString());
+                    }
+                    propValue = values;
+                } else {
+                    propValue = attr.getString();
+                }
+                props.put(attr.getId(), propValue);
+            }
+        }
     }
 
     @Nonnull

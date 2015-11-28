@@ -18,6 +18,9 @@ package org.apache.jackrabbit.oak.plugins.document.rdb;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import static org.apache.jackrabbit.oak.plugins.document.UpdateUtils.checkConditions;
+import static org.apache.jackrabbit.oak.plugins.document.rdb.RDBJDBCTools.closeResultSet;
+import static org.apache.jackrabbit.oak.plugins.document.rdb.RDBJDBCTools.closeStatement;
+import static org.apache.jackrabbit.oak.plugins.document.rdb.RDBJDBCTools.createTableName;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -33,15 +36,17 @@ import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.locks.Lock;
 import java.util.zip.Deflater;
@@ -59,8 +64,6 @@ import org.apache.jackrabbit.oak.plugins.document.DocumentMK;
 import org.apache.jackrabbit.oak.plugins.document.DocumentStore;
 import org.apache.jackrabbit.oak.plugins.document.DocumentStoreException;
 import org.apache.jackrabbit.oak.plugins.document.NodeDocument;
-import org.apache.jackrabbit.oak.plugins.document.Revision;
-import org.apache.jackrabbit.oak.plugins.document.StableRevisionComparator;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp.Condition;
 import org.apache.jackrabbit.oak.plugins.document.UpdateOp.Key;
@@ -69,6 +72,7 @@ import org.apache.jackrabbit.oak.plugins.document.UpdateUtils;
 import org.apache.jackrabbit.oak.plugins.document.cache.CacheInvalidationStats;
 import org.apache.jackrabbit.oak.plugins.document.mongo.MongoDocumentStore;
 import org.apache.jackrabbit.oak.plugins.document.util.StringValue;
+import org.apache.jackrabbit.oak.util.OakVersion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -77,6 +81,9 @@ import com.google.common.cache.Cache;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.google.common.hash.BloomFilter;
+import com.google.common.hash.Funnel;
+import com.google.common.hash.PrimitiveSink;
 import com.google.common.util.concurrent.Striped;
 
 /**
@@ -89,10 +96,12 @@ import com.google.common.util.concurrent.Striped;
  * simplify testing, and <em>that</em> code specifically supports these
  * databases:
  * <ul>
- * <li>h2</li>
+ * <li>H2DB</li>
+ * <li>Apache Derby</li>
  * <li>IBM DB2</li>
- * <li>Postgres</li>
+ * <li>PostgreSQL</li>
  * <li>MariaDB (MySQL) (experimental)</li>
+ * <li>Microsoft SQL Server (experimental)</li>
  * <li>Oracle (experimental)</li>
  * </ul>
  * 
@@ -117,8 +126,7 @@ import com.google.common.util.concurrent.Striped;
  * <th>ID</th>
  * <td>varchar(512) not null primary key</td>
  * <td>the document's key (for databases that can not handle 512 character
- * primary keys, such as MySQL, varbinary is possible as well; note that this
- * currently needs to be hardcoded)</td>
+ * primary keys, such as MySQL, varbinary is possible as wells)</td>
  * </tr>
  * <tr>
  * <th>MODIFIED</th>
@@ -165,19 +173,18 @@ import com.google.common.util.concurrent.Striped;
  * The names of database tables can be prefixed; the purpose is mainly for
  * testing, as tables can also be dropped automatically when the store is
  * disposed (this only happens for those tables that have been created on
- * demand)
+ * demand).
  * <p>
  * <em>Note that the database needs to be created/configured to support all Unicode
  * characters in text fields, and to collate by Unicode code point (in DB2: "collate using identity",
  * in Postgres: "C").
  * THIS IS NOT THE DEFAULT!</em>
  * <p>
- * <em>For MySQL, the database parameter "max_allowed_packet" needs to be increased to support ~16 blobs.</em>
+ * <em>For MySQL, the database parameter "max_allowed_packet" needs to be increased to support ~16M blobs.</em>
  * 
  * <h3>Caching</h3>
  * <p>
- * The cache borrows heavily from the {@link MongoDocumentStore} implementation;
- * however it does not support the off-heap mechanism yet.
+ * The cache borrows heavily from the {@link MongoDocumentStore} implementation.
  * 
  * <h3>Queries</h3>
  * <p>
@@ -262,11 +269,13 @@ public class RDBDocumentStore implements DocumentStore {
 
     @Override
     public <T extends Document> void update(Collection<T> collection, List<String> keys, UpdateOp updateOp) {
+        UpdateUtils.assertUnconditional(updateOp);
         internalUpdate(collection, keys, updateOp);
     }
 
     @Override
     public <T extends Document> T createOrUpdate(Collection<T> collection, UpdateOp update) {
+        UpdateUtils.assertUnconditional(update);
         return internalCreateOrUpdate(collection, update, true, false);
     }
 
@@ -282,10 +291,31 @@ public class RDBDocumentStore implements DocumentStore {
         }
         return null;
     }
+    @Override
+    public CacheInvalidationStats invalidateCache(Iterable<String> keys) {
+        //TODO: optimize me
+        return invalidateCache();
+    }
 
     @Override
     public <T extends Document> void invalidateCache(Collection<T> collection, String id) {
         invalidateCache(collection, id, false);
+    }
+
+    @Override
+    public long determineServerTimeDifferenceMillis() {
+        Connection connection = null;
+        try {
+            connection = this.ch.getROConnection();
+            long result = this.db.determineServerTimeDifferenceMillis(connection, getTable(Collection.NODES));
+            connection.commit();
+            return result;
+        } catch (SQLException ex) {
+            LOG.error("Trying to determine time difference to server", ex);
+            throw new DocumentStoreException(ex);
+        } finally {
+            this.ch.closeConnection(connection);
+        }
     }
 
     private <T extends Document> void invalidateCache(Collection<T> collection, String id, boolean remove) {
@@ -318,6 +348,62 @@ public class RDBDocumentStore implements DocumentStore {
         return this.droppedTables;
     }
 
+    // table names
+    private static Map<Collection<? extends Document>, String> TABLEMAP;
+    private static List<String> TABLENAMES;
+    static {
+        Map<Collection<? extends Document>, String> tmp = new HashMap<Collection<? extends Document>, String>();
+        tmp.put(Collection.CLUSTER_NODES, "CLUSTERNODES");
+        tmp.put(Collection.JOURNAL, "JOURNAL");
+        tmp.put(Collection.NODES, "NODES");
+        tmp.put(Collection.SETTINGS, "SETTINGS");
+        TABLEMAP = Collections.unmodifiableMap(tmp);
+        List<String> tl = new ArrayList<String>(TABLEMAP.values());
+        Collections.sort(tl);
+        TABLENAMES = Collections.unmodifiableList(tl);
+    }
+
+    public static List<String> getTableNames() {
+        return TABLENAMES;
+    }
+
+    /**
+     * Holds the data about a table that can vary: name, whether the primary key
+     * is binary, and the estimated size of the "data" column.
+     */
+    static class RDBTableMetaData {
+
+        private final String name;
+        private boolean idIsBinary = false;
+        private int dataLimitInOctets = 16384;
+
+        public RDBTableMetaData(String name) {
+            this.name = name;
+        }
+
+        public int getDataLimitInOctets() {
+            return this.dataLimitInOctets;
+        }
+
+        public String getName() {
+            return this.name;
+        }
+
+        public boolean isIdBinary() {
+            return this.idIsBinary;
+        }
+
+        public void setIdIsBinary(boolean idIsBinary) {
+            this.idIsBinary = idIsBinary;
+        }
+
+        public void setDataLimitInOctets(int dataLimitInOctets) {
+            this.dataLimitInOctets = dataLimitInOctets;
+        }
+    }
+
+    private final Map<Collection<? extends Document>, RDBTableMetaData> tableMeta = new HashMap<Collection<? extends Document>, RDBTableMetaData>();
+
     @Override
     public void dispose() {
         if (!this.tablesToBeDropped.isEmpty()) {
@@ -337,7 +423,7 @@ public class RDBDocumentStore implements DocumentStore {
                     } catch (SQLException ex) {
                         LOG.debug("attempting to drop: " + tname, ex);
                     } finally {
-                        this.ch.closeStatement(stmt);
+                        closeStatement(stmt);
                     }
                 } catch (SQLException ex) {
                     LOG.debug("attempting to drop: " + tname, ex);
@@ -347,7 +433,11 @@ public class RDBDocumentStore implements DocumentStore {
             }
             this.droppedTables = dropped.trim();
         }
-        this.ch = null;
+        try {
+            this.ch.close();
+        } catch (IOException ex) {
+            LOG.error("closing connection handler", ex);
+        }
     }
 
     @Override
@@ -372,379 +462,17 @@ public class RDBDocumentStore implements DocumentStore {
 
     // implementation
 
-    enum FETCHFIRSTSYNTAX { FETCHFIRST, LIMIT, TOP};
-
-
-    private static void versionCheck(DatabaseMetaData md, int xmaj, int xmin, String description) throws SQLException {
-        int maj = md.getDatabaseMajorVersion();
-        int min = md.getDatabaseMinorVersion();
-        if (maj < xmaj || (maj == xmaj && min < xmin)) {
-            LOG.info("Unsupported " + description + " version: " + maj + "." + min + ", expected at least " + xmaj + "." + xmin);
-        }
-    }
-
-    /**
-     * Defines variation in the capabilities of different RDBs.
-     */
-    protected enum DB {
-        DEFAULT("default") {
-        },
-
-        H2("H2") {
-            @Override
-            public void checkVersion(DatabaseMetaData md) throws SQLException {
-                versionCheck(md, 1, 4, description);
-            }
-        },
-
-        POSTGRES("PostgreSQL") {
-            @Override
-            public void checkVersion(DatabaseMetaData md) throws SQLException {
-                versionCheck(md, 9, 3, description);
-            }
-
-            @Override
-            public String getTableCreationStatement(String tableName) {
-                return ("create table " + tableName + " (ID varchar(512) not null primary key, MODIFIED bigint, HASBINARY smallint, DELETEDONCE smallint, MODCOUNT bigint, CMODCOUNT bigint, DSIZE bigint, DATA varchar(16384), BDATA bytea)");
-            }
-
-            @Override
-            public String getAdditionalDiagnostics(RDBConnectionHandler ch, String tableName) {
-                Connection con = null;
-                Map<String, String> result = new HashMap<String, String>();
-                try {
-                    con = ch.getROConnection();
-                    String cat = con.getCatalog();
-                    PreparedStatement stmt = con.prepareStatement("SELECT pg_encoding_to_char(encoding), datcollate FROM pg_database WHERE datname=?");
-                    stmt.setString(1, cat);
-                    ResultSet rs = stmt.executeQuery();
-                    while (rs.next()) {
-                        result.put("pg_encoding_to_char(encoding)", rs.getString(1));
-                        result.put("datcollate", rs.getString(2));
-                    }
-                    stmt.close();
-                    con.commit();
-                } catch (SQLException ex) {
-                    LOG.debug("while getting diagnostics", ex);
-                } finally {
-                    ch.closeConnection(con);
-                }
-                return result.toString();
-            }
-        },
-
-        DB2("DB2") {
-            @Override
-            public void checkVersion(DatabaseMetaData md) throws SQLException {
-                versionCheck(md, 10, 5, description);
-            }
-
-            @Override
-            public String getAdditionalDiagnostics(RDBConnectionHandler ch, String tableName) {
-                Connection con = null;
-                Map<String, String> result = new HashMap<String, String>();
-                try {
-                    con = ch.getROConnection();
-                    // we can't look up by schema as con.getSchema is JDK 1.7
-                    PreparedStatement stmt = con.prepareStatement("SELECT CODEPAGE, COLLATIONSCHEMA, COLLATIONNAME, TABSCHEMA FROM SYSCAT.COLUMNS WHERE COLNAME=? and COLNO=0 AND UPPER(TABNAME)=UPPER(?)");
-                    stmt.setString(1, "ID");
-                    stmt.setString(2, tableName);
-                    ResultSet rs = stmt.executeQuery();
-                    while (rs.next() && result.size() < 20) {
-                        // thus including the schema name here
-                        String schema = rs.getString("TABSCHEMA").trim();
-                        result.put(schema + ".CODEPAGE", rs.getString("CODEPAGE").trim());
-                        result.put(schema + ".COLLATIONSCHEMA", rs.getString("COLLATIONSCHEMA").trim());
-                        result.put(schema + ".COLLATIONNAME", rs.getString("COLLATIONNAME").trim());
-                    }
-                    stmt.close();
-                    con.commit();
-                } catch (SQLException ex) {
-                    LOG.debug("while getting diagnostics", ex);
-                } finally {
-                    ch.closeConnection(con);
-                }
-                return result.toString();
-            }
-},
-
-        ORACLE("Oracle") {
-            @Override
-            public void checkVersion(DatabaseMetaData md) throws SQLException {
-                versionCheck(md, 12, 1, description);
-            }
-
-            @Override
-            public String getInitializationStatement() {
-                // see https://issues.apache.org/jira/browse/OAK-1914
-                // for some reason, the default for NLS_SORT is incorrect
-                return ("ALTER SESSION SET NLS_SORT='BINARY'");
-            }
-
-            @Override
-            public String getTableCreationStatement(String tableName) {
-                // see https://issues.apache.org/jira/browse/OAK-1914
-                return ("create table " + tableName + " (ID varchar(512) not null primary key, MODIFIED number, HASBINARY number, DELETEDONCE number, MODCOUNT number, CMODCOUNT number, DSIZE number, DATA varchar(4000), BDATA blob)");
-            }
-
-            @Override
-            public String getAdditionalDiagnostics(RDBConnectionHandler ch, String tableName) {
-                Connection con = null;
-                Map<String, String> result = new HashMap<String, String>();
-                try {
-                    con = ch.getROConnection();
-                    Statement stmt = con.createStatement();
-                    ResultSet rs = stmt.executeQuery("SELECT PARAMETER, VALUE from NLS_DATABASE_PARAMETERS WHERE PARAMETER IN ('NLS_COMP', 'NLS_CHARACTERSET')");
-                    while (rs.next()) {
-                        result.put(rs.getString(1), rs.getString(2));
-                    }
-                    stmt.close();
-                    con.commit();
-                } catch (SQLException ex) {
-                    LOG.debug("while getting diagnostics", ex);
-                } finally {
-                    ch.closeConnection(con);
-                }
-                return result.toString();
-            }
-        },
-
-        MYSQL("MySQL") {
-            @Override
-            public void checkVersion(DatabaseMetaData md) throws SQLException {
-                versionCheck(md, 5, 5, description);
-            }
-
-            @Override
-            public boolean isPrimaryColumnByteEncoded() {
-                // TODO: we should dynamically detect this
-                return true;
-            }
-
-            @Override
-            public String getTableCreationStatement(String tableName) {
-                // see https://issues.apache.org/jira/browse/OAK-1913
-                return ("create table " + tableName + " (ID varbinary(512) not null primary key, MODIFIED bigint, HASBINARY smallint, DELETEDONCE smallint, MODCOUNT bigint, CMODCOUNT bigint, DSIZE bigint, DATA varchar(16000), BDATA longblob)");
-            }
-
-            @Override
-            public FETCHFIRSTSYNTAX getFetchFirstSyntax() {
-                return FETCHFIRSTSYNTAX.LIMIT;
-            }
-
-            @Override
-            public String getConcatQueryString(int dataOctetLimit, int dataLength) {
-                return "CONCAT(DATA, ?)";
-            }
-
-            @Override
-            public String getAdditionalDiagnostics(RDBConnectionHandler ch, String tableName) {
-                Connection con = null;
-                Map<String, String> result = new HashMap<String, String>();
-                try {
-                    con = ch.getROConnection();
-                    PreparedStatement stmt = con.prepareStatement("SHOW TABLE STATUS LIKE ?");
-                    stmt.setString(1, tableName);
-                    ResultSet rs = stmt.executeQuery();
-                    while (rs.next()) {
-                        result.put("collation", rs.getString("Collation"));
-                    }
-                    stmt.close();
-                    con.commit();
-                } catch (SQLException ex) {
-                    LOG.debug("while getting diagnostics", ex);
-                } finally {
-                    ch.closeConnection(con);
-                }
-                return result.toString();
-            }
-        },
-
-        MSSQL("Microsoft SQL Server") {
-            @Override
-            public void checkVersion(DatabaseMetaData md) throws SQLException {
-                versionCheck(md, 11, 0, description);
-            }
-
-            @Override
-            public boolean isPrimaryColumnByteEncoded() {
-                // TODO: we should dynamically detect this
-                return true;
-            }
-
-            @Override
-            public String getTableCreationStatement(String tableName) {
-                // see https://issues.apache.org/jira/browse/OAK-2395
-                return ("create table " + tableName + " (ID varbinary(512) not null primary key, MODIFIED bigint, HASBINARY smallint, DELETEDONCE smallint, MODCOUNT bigint, CMODCOUNT bigint, DSIZE bigint, DATA nvarchar(4000), BDATA varbinary(max))");
-            }
-
-            @Override
-            public FETCHFIRSTSYNTAX getFetchFirstSyntax() {
-                return FETCHFIRSTSYNTAX.TOP;
-            }
-
-            @Override
-            public String getConcatQueryString(int dataOctetLimit, int dataLength) {
-                /*
-                 * To avoid truncation when concatenating force an error when
-                 * limit is above the octet limit
-                 */
-                return "CASE WHEN LEN(DATA) <= " + (dataOctetLimit - dataLength) + " THEN (DATA + CAST(? AS nvarchar("
-                        + dataOctetLimit + "))) ELSE (DATA + CAST(DATA AS nvarchar(max))) END";
-
-            }
-
-            @Override
-            public String getGreatestQueryString(String column) {
-                return "(select MAX(mod) from (VALUES (" + column + "), (?)) AS ALLMOD(mod))";
-            }
-
-            @Override
-            public String getAdditionalDiagnostics(RDBConnectionHandler ch, String tableName) {
-                Connection con = null;
-                Map<String, String> result = new HashMap<String, String>();
-                try {
-                    con = ch.getROConnection();
-                    String cat = con.getCatalog();
-                    PreparedStatement stmt = con.prepareStatement("SELECT collation_name FROM sys.databases WHERE name=?");
-                    stmt.setString(1, cat);
-                    ResultSet rs = stmt.executeQuery();
-                    while (rs.next()) {
-                        result.put("collation_name", rs.getString(1));
-                    }
-                    stmt.close();
-                    con.commit();
-                } catch (SQLException ex) {
-                    LOG.debug("while getting diagnostics", ex);
-                } finally {
-                    ch.closeConnection(con);
-                }
-                return result.toString();
-            }
-        };
-
-        /**
-         * Check the database brand and version
-         */
-        public void checkVersion(DatabaseMetaData md) throws SQLException {
-            LOG.info("Unknown database type: " + md.getDatabaseProductName());
-        }
-
-        /**
-         * If the primary column is encoded in bytes.
-         * Default false
-         * @return boolean
-         */
-        public boolean isPrimaryColumnByteEncoded() {
-            return false;
-        }
-
-        /**
-         * Allows case in select. Default true.
-         */
-        public boolean allowsCaseInSelect() {
-            return true;
-        }
-
-        /**
-         * Query syntax for "FETCH FIRST"
-         */
-        public FETCHFIRSTSYNTAX getFetchFirstSyntax() {
-            return FETCHFIRSTSYNTAX.FETCHFIRST;
-        }
-
-        /**
-         * Returns the CONCAT function or its equivalent function or sub-query.
-         * Note that the function MUST NOT cause a truncated value to be
-         * written!
-         *
-         * @param dataOctetLimit
-         *            expected capacity of data column
-         * @param dataLength
-         *            length of string to be inserted
-         * 
-         * @return the concat query string
-         */
-        public String getConcatQueryString(int dataOctetLimit, int dataLength) {
-            return "DATA || CAST(? AS varchar(" + dataOctetLimit + "))";
-        }
-
-        /**
-         * Returns the GREATEST function or its equivalent function or sub-query
-         * supported.
-         *
-         * @return the greatest query string
-         */
-        public String getGreatestQueryString(String column) {
-            return "GREATEST(" + column + ", ?)";
-        }
-
-        /**
-         * Query for any required initialization of the DB.
-         * 
-         * @return the DB initialization SQL string
-         */
-        public @Nonnull String getInitializationStatement() {
-            return "";
-        }
-
-        /**
-         * Table creation statement string
-         *
-         * @param tableName
-         * @return the table creation string
-         */
-        public String getTableCreationStatement(String tableName) {
-            return "create table "
-                    + tableName
-                    + " (ID varchar(512) not null primary key, MODIFIED bigint, HASBINARY smallint, DELETEDONCE smallint, MODCOUNT bigint, CMODCOUNT bigint, DSIZE bigint, DATA varchar(16384), BDATA blob("
-                    + 1024 * 1024 * 1024 + "))";
-        }
-
-        public String getAdditionalDiagnostics(RDBConnectionHandler ch, String tableName) {
-            return "";
-        }
-
-        protected String description;
-
-        private DB(String description) {
-            this.description = description;
-        }
-
-        @Override
-        public String toString() {
-            return this.description;
-        }
-
-        @Nonnull
-        public static DB getValue(String desc) {
-            for (DB db : DB.values()) {
-                if (db.description.equals(desc)) {
-                    return db;
-                } else if (db == DB2 && desc.startsWith("DB2/")) {
-                    return db;
-                }
-            }
-
-            LOG.error("DB type " + desc + " unknown, trying default settings");
-            DEFAULT.description = desc + " - using default settings";
-            return DEFAULT;
-        }
-    }
-
     private static final String MODIFIED = "_modified";
     private static final String MODCOUNT = "_modCount";
 
     /**
      * Optional counter for changes to "_collisions" map ({@link NodeDocument#COLLISIONS}).
      */
-    private static final String COLLISIONSMODCOUNT = "_collisionsModCount";
+    public static final String COLLISIONSMODCOUNT = "_collisionsModCount";
 
     private static final String ID = "_id";
 
     private static final Logger LOG = LoggerFactory.getLogger(RDBDocumentStore.class);
-
-    private final Comparator<Revision> comparator = StableRevisionComparator.REVERSE;
 
     private Exception callStack;
 
@@ -753,17 +481,11 @@ public class RDBDocumentStore implements DocumentStore {
     // from options
     private Set<String> tablesToBeDropped = new HashSet<String>();
 
-    // table names
-    private String tnNodes, tnClusterNodes, tnSettings; 
-
     // ratio between Java characters and UTF-8 encoding
     // a) single characters will fit into 3 bytes
     // b) a surrogate pair (two Java characters) will fit into 4 bytes
     // thus...
-    private static final int CHAR2OCTETRATIO = 3;
-
-    // capacity of DATA column
-    private int dataLimitInOctets = 16384;
+    public static final int CHAR2OCTETRATIO = 3;
 
     // number of retries for updates
     private static final int RETRIES = 10;
@@ -771,8 +493,13 @@ public class RDBDocumentStore implements DocumentStore {
     // see OAK-2044
     protected static final boolean USECMODCOUNT = true;
 
+    private static final Key MODIFIEDKEY = new Key(MODIFIED, null);
+
     // DB-specific information
-    private DB db;
+    private RDBDocumentStoreDB dbInfo;
+
+    // utility class for performing low-level operations
+    private RDBDocumentStoreJDBC db;
 
     private Map<String, String> metadata;
 
@@ -784,13 +511,18 @@ public class RDBDocumentStore implements DocumentStore {
     private static final Set<String> COLUMNPROPERTIES = new HashSet<String>(Arrays.asList(new String[] { ID,
             NodeDocument.HAS_BINARY_FLAG, NodeDocument.DELETED_ONCE, COLLISIONSMODCOUNT, MODIFIED, MODCOUNT }));
 
-    private final RDBDocumentSerializer SR = new RDBDocumentSerializer(this, COLUMNPROPERTIES);
+    private final RDBDocumentSerializer ser = new RDBDocumentSerializer(this, COLUMNPROPERTIES);
 
     private void initialize(DataSource ds, DocumentMK.Builder builder, RDBOptions options) throws Exception {
 
-        this.tnNodes = RDBJDBCTools.createTableName(options.getTablePrefix(), "NODES");
-        this.tnClusterNodes = RDBJDBCTools.createTableName(options.getTablePrefix(), "CLUSTERNODES");
-        this.tnSettings = RDBJDBCTools.createTableName(options.getTablePrefix(), "SETTINGS");
+        this.tableMeta.put(Collection.NODES,
+                new RDBTableMetaData(createTableName(options.getTablePrefix(), TABLEMAP.get(Collection.NODES))));
+        this.tableMeta.put(Collection.CLUSTER_NODES,
+                new RDBTableMetaData(createTableName(options.getTablePrefix(), TABLEMAP.get(Collection.CLUSTER_NODES))));
+        this.tableMeta.put(Collection.JOURNAL,
+                new RDBTableMetaData(createTableName(options.getTablePrefix(), TABLEMAP.get(Collection.JOURNAL))));
+        this.tableMeta.put(Collection.SETTINGS,
+                new RDBTableMetaData(createTableName(options.getTablePrefix(), TABLEMAP.get(Collection.SETTINGS))));
 
         this.ch = new RDBConnectionHandler(ds);
         this.callStack = LOG.isDebugEnabled() ? new Exception("call stack of RDBDocumentStore creation") : null;
@@ -799,38 +531,60 @@ public class RDBDocumentStore implements DocumentStore {
         this.cacheStats = new CacheStats(nodesCache, "Document-Documents", builder.getWeigher(), builder.getDocumentCacheSize());
 
         Connection con = this.ch.getRWConnection();
+
+        int isolation = con.getTransactionIsolation();
+        String isolationDiags = RDBJDBCTools.isolationLevelToString(isolation);
+        if (isolation != Connection.TRANSACTION_READ_COMMITTED) {
+            LOG.info("Detected transaction isolation level " + isolationDiags + " is "
+                    + (isolation < Connection.TRANSACTION_READ_COMMITTED ? "lower" : "higher") + " than expected "
+                    + RDBJDBCTools.isolationLevelToString(Connection.TRANSACTION_READ_COMMITTED)
+                    + " - check datasource configuration");
+        }
+
         DatabaseMetaData md = con.getMetaData();
-        String dbDesc = md.getDatabaseProductName() + " " + md.getDatabaseProductVersion();
-        String driverDesc = md.getDriverName() + " " + md.getDriverVersion();
+        String dbDesc = String.format("%s %s (%d.%d)", md.getDatabaseProductName(), md.getDatabaseProductVersion(),
+                md.getDatabaseMajorVersion(), md.getDatabaseMinorVersion()).replaceAll("[\r\n\t]", " ").trim();
+        String driverDesc = String.format("%s %s (%d.%d)", md.getDriverName(), md.getDriverVersion(), md.getDriverMajorVersion(),
+                md.getDriverMinorVersion()).replaceAll("[\r\n\t]", " ").trim();
         String dbUrl = md.getURL();
 
-        this.db = DB.getValue(md.getDatabaseProductName());
+        this.dbInfo = RDBDocumentStoreDB.getValue(md.getDatabaseProductName());
+        this.db = new RDBDocumentStoreJDBC(this.dbInfo, this.ser, QUERYHITSLIMIT, QUERYTIMELIMIT);
         this.metadata = ImmutableMap.<String,String>builder()
                 .put("type", "rdb")
                 .put("db", md.getDatabaseProductName())
                 .put("version", md.getDatabaseProductVersion())
                 .build();
-        db.checkVersion(md);
+        String versionDiags = dbInfo.checkVersion(md);
+        if (!versionDiags.isEmpty()) {
+            LOG.info(versionDiags);
+        }
 
-        if (! "".equals(db.getInitializationStatement())) {
+        if (! "".equals(dbInfo.getInitializationStatement())) {
             Statement stmt = null;
             try {
                 stmt = con.createStatement();
-                stmt.execute(db.getInitializationStatement());
+                stmt.execute(dbInfo.getInitializationStatement());
                 stmt.close();
                 con.commit();
             }
             finally {
-                this.ch.closeStatement(stmt);
+                closeStatement(stmt);
             }
         }
 
         List<String> tablesCreated = new ArrayList<String>();
         List<String> tablesPresent = new ArrayList<String>();
+        StringBuilder tableDiags = new StringBuilder();
         try {
-            createTableFor(con, Collection.CLUSTER_NODES, tablesCreated, tablesPresent);
-            createTableFor(con, Collection.NODES, tablesCreated, tablesPresent);
-            createTableFor(con, Collection.SETTINGS, tablesCreated, tablesPresent);
+            createTableFor(con, Collection.CLUSTER_NODES, this.tableMeta.get(Collection.CLUSTER_NODES), tablesCreated,
+                    tablesPresent, tableDiags);
+            createTableFor(con, Collection.NODES, this.tableMeta.get(Collection.NODES), tablesCreated, tablesPresent,
+                    tableDiags);
+            createTableFor(con, Collection.SETTINGS, this.tableMeta.get(Collection.SETTINGS), tablesCreated, tablesPresent,
+                    tableDiags);
+            createTableFor(con, Collection.JOURNAL, this.tableMeta.get(Collection.JOURNAL), tablesCreated, tablesPresent,
+                    tableDiags);
         } finally {
             con.commit();
             con.close();
@@ -840,10 +594,15 @@ public class RDBDocumentStore implements DocumentStore {
             tablesToBeDropped.addAll(tablesCreated);
         }
 
-        String diag = db.getAdditionalDiagnostics(this.ch, this.tnNodes);
+        if (tableDiags.length() != 0) {
+            tableDiags.insert(0, ", ");
+        }
 
-        LOG.info("RDBDocumentStore instantiated for database " + dbDesc + ", using driver: " + driverDesc + ", connecting to: "
-                + dbUrl + (diag.isEmpty() ? "" : (", properties: " + diag)));
+        String diag = dbInfo.getAdditionalDiagnostics(this.ch, this.tableMeta.get(Collection.NODES).getName());
+
+        LOG.info("RDBDocumentStore (" + OakVersion.getVersion() + ") instantiated for database " + dbDesc + ", using driver: "
+                + driverDesc + ", connecting to: " + dbUrl + (diag.isEmpty() ? "" : (", properties: " + diag))
+                + ", transaction isolation level: " + isolationDiags + tableDiags);
         if (!tablesPresent.isEmpty()) {
             LOG.info("Tables present upon startup: " + tablesPresent);
         }
@@ -853,25 +612,150 @@ public class RDBDocumentStore implements DocumentStore {
         }
     }
 
-    private void createTableFor(Connection con, Collection<? extends Document> col, List<String> tablesCreated, List<String> tablesPresent) throws SQLException {
-        String dbname = this.db.toString();
+    private static boolean isBinaryType(int sqlType) {
+        return sqlType == Types.VARBINARY || sqlType == Types.BINARY || sqlType == Types.LONGVARBINARY;
+    }
+
+    private void obtainFlagsFromResultSetMeta(ResultSetMetaData met, RDBTableMetaData tmd) throws SQLException {
+        for (int i = 1; i <= met.getColumnCount(); i++) {
+            String lcName = met.getColumnName(i).toLowerCase(Locale.ENGLISH);
+            if ("id".equals(lcName)) {
+                tmd.setIdIsBinary(isBinaryType(met.getColumnType(i)));
+            }
+            if ("data".equals(lcName)) {
+                tmd.setDataLimitInOctets(met.getPrecision(i));
+            }
+        }
+    }
+
+    private static String asQualifiedDbName(String one, String two) {
+        if (one == null && two == null) {
+            return null;
+        }
+        else {
+            one = one == null ? "" : one.trim();
+            two = two == null ? "" : two.trim();
+            return one.isEmpty() ? two : one + "." + two;
+        }
+    }
+
+    private static String indexTypeAsString(int type) {
+        switch (type) {
+            case DatabaseMetaData.tableIndexClustered:
+                return "clustered";
+            case DatabaseMetaData.tableIndexHashed:
+                return "hashed";
+            case DatabaseMetaData.tableIndexStatistic:
+                return "statistic";
+            case DatabaseMetaData.tableIndexOther:
+                return "other";
+            default:
+                return "indexType=" + type;
+        }
+    }
+
+    private String dumpIndexData(DatabaseMetaData met, ResultSetMetaData rmet, String tableName) {
+
+        ResultSet rs = null;
+        try {
+            // if the result set metadata provides a table name, use that (the other one
+            // might be inaccurate due to case insensitivity issues
+            String rmetTableName = rmet.getTableName(1);
+            if (rmetTableName != null && !rmetTableName.trim().isEmpty()) {
+                tableName = rmetTableName.trim();
+            }
+
+            String rmetSchemaName = rmet.getSchemaName(1);
+            rmetSchemaName = rmetSchemaName == null ? "" : rmetSchemaName.trim();
+
+            Map<String, Map<String, Object>> indices = new TreeMap<String, Map<String, Object>>();
+            StringBuilder sb = new StringBuilder();
+            rs = met.getIndexInfo(null, null, tableName, false, true);
+            while (rs.next()) {
+                String name = asQualifiedDbName(rs.getString(5), rs.getString(6));
+                if (name != null) {
+                    Map<String, Object> info = indices.get(name);
+                    if (info == null) {
+                        info = new HashMap<String, Object>();
+                        indices.put(name, info);
+                        info.put("fields", new TreeMap<Integer, String>());
+                    }
+                    info.put("nonunique", rs.getBoolean(4));
+                    info.put("type", indexTypeAsString(rs.getInt(7)));
+                    String inSchema = rs.getString(2);
+                    inSchema = inSchema == null ? "" : inSchema.trim();
+                    // skip indices on tables in other schemas in case we have that information
+                    if (rmetSchemaName.isEmpty() || inSchema.isEmpty() || rmetSchemaName.equals(inSchema)) {
+                        String tname = asQualifiedDbName(inSchema, rs.getString(3));
+                        info.put("tname", tname);
+                        String cname = rs.getString(9);
+                        if (cname != null) {
+                            String order = "A".equals(rs.getString(10)) ? " ASC" : ("D".equals(rs.getString(10)) ? " DESC" : "");
+                            ((Map<Integer, String>) info.get("fields")).put(rs.getInt(8), cname + order);
+                        }
+                    }
+                }
+            }
+            for (Entry<String, Map<String, Object>> index : indices.entrySet()) {
+                boolean nonUnique = ((Boolean) index.getValue().get("nonunique"));
+                Map<Integer, String> fields = (Map<Integer, String>) index.getValue().get("fields");
+                if (!fields.isEmpty()) {
+                    if (sb.length() != 0) {
+                        sb.append(", ");
+                    }
+                    sb.append(String.format("%sindex %s on %s (", nonUnique ? "" : "unique ", index.getKey(),
+                            index.getValue().get("tname")));
+                    String delim = "";
+                    for (String field : fields.values()) {
+                        sb.append(delim);
+                        delim = ", ";
+                        sb.append(field);
+                    }
+                    sb.append(")");
+                    sb.append(" ").append(index.getValue().get("type"));
+                }
+            }
+            if (sb.length() != 0) {
+                sb.insert(0, "/* ").append(" */");
+            }
+            return sb.toString();
+        } catch (SQLException ex) {
+            // well it was best-effort
+            return String.format("/* exception while retrieving index information: %s, code %d, state %s */",
+                    ex.getMessage(), ex.getErrorCode(), ex.getSQLState());
+        } finally {
+            closeResultSet(rs);
+        }
+    }
+
+    private void createTableFor(Connection con, Collection<? extends Document> col, RDBTableMetaData tmd, List<String> tablesCreated,
+            List<String> tablesPresent, StringBuilder diagnostics) throws SQLException {
+        String dbname = this.dbInfo.toString();
         if (con.getMetaData().getURL() != null) {
             dbname += " (" + con.getMetaData().getURL() + ")";
         }
-        String tableName = getTable(col);
+        String tableName = tmd.getName();
 
-        PreparedStatement checkStatement = null;
+        PreparedStatement checkStatement = null, checkStatement2 = null;
+
         ResultSet checkResultSet = null;
         Statement creatStatement = null;
         try {
-            checkStatement = con.prepareStatement("select DATA from " + tableName + " where ID = ?");
+            checkStatement = con.prepareStatement("select * from " + tableName + " where ID = ?");
             checkStatement.setString(1, "0:/");
             checkResultSet = checkStatement.executeQuery();
 
-            if (col.equals(Collection.NODES)) {
-                // try to discover size of DATA column
-                ResultSetMetaData met = checkResultSet.getMetaData();
-                this.dataLimitInOctets = met.getPrecision(1);
+            // try to discover size of DATA column and binary-ness of ID
+            ResultSetMetaData met = checkResultSet.getMetaData();
+            obtainFlagsFromResultSetMeta(met, tmd);
+
+            if (col == Collection.NODES) {
+                String tableInfo = RDBJDBCTools.dumpResultSetMeta(met);
+                diagnostics.append(tableInfo);
+                String indexInfo = dumpIndexData(con.getMetaData(), met, tableName);
+                if (!indexInfo.isEmpty()) {
+                    diagnostics.append(" ").append(indexInfo);
+                }
             }
             tablesPresent.add(tableName);
         } catch (SQLException ex) {
@@ -880,19 +764,33 @@ public class RDBDocumentStore implements DocumentStore {
 
             try {
                 creatStatement = con.createStatement();
-                creatStatement.execute(this.db.getTableCreationStatement(tableName));
+                creatStatement.execute(this.dbInfo.getTableCreationStatement(tableName));
                 creatStatement.close();
+
+                for (String ic : this.dbInfo.getIndexCreationStatements(tableName)) {
+                    creatStatement = con.createStatement();
+                    creatStatement.execute(ic);
+                    creatStatement.close();
+                }
 
                 con.commit();
 
                 tablesCreated.add(tableName);
 
-                if (col.equals(Collection.NODES)) {
-                    PreparedStatement pstmt = con.prepareStatement("select DATA from " + tableName + " where ID = ?");
-                    pstmt.setString(1, "0:/");
-                    ResultSet rs = pstmt.executeQuery();
-                    ResultSetMetaData met = rs.getMetaData();
-                    this.dataLimitInOctets = met.getPrecision(1);
+                checkStatement2 = con.prepareStatement("select * from " + tableName + " where ID = ?");
+                checkStatement2.setString(1, "0:/");
+                ResultSet rs = checkStatement2.executeQuery();
+                // try to discover size of DATA column and binary-ness of ID
+                ResultSetMetaData met = rs.getMetaData();
+                obtainFlagsFromResultSetMeta(met, tmd);
+
+                if (col == Collection.NODES) {
+                    String tableInfo = RDBJDBCTools.dumpResultSetMeta(met);
+                    diagnostics.append(tableInfo);
+                    String indexInfo = dumpIndexData(con.getMetaData(), met, tableName);
+                    if (!indexInfo.isEmpty()) {
+                        diagnostics.append(" ").append(indexInfo);
+                    }
                 }
             }
             catch (SQLException ex2) {
@@ -901,15 +799,16 @@ public class RDBDocumentStore implements DocumentStore {
             }
         }
         finally {
-            this.ch.closeResultSet(checkResultSet);
-            this.ch.closeStatement(checkStatement);
-            this.ch.closeStatement(creatStatement);
+            closeResultSet(checkResultSet);
+            closeStatement(checkStatement);
+            closeStatement(checkStatement2);
+            closeStatement(creatStatement);
         }
     }
 
     @Override
     protected void finalize() {
-        if (this.ch != null && this.callStack != null) {
+        if (!this.ch.isClosed() && this.callStack != null) {
             LOG.debug("finalizing RDBDocumentStore that was not disposed", this.callStack);
         }
     }
@@ -980,28 +879,32 @@ public class RDBDocumentStore implements DocumentStore {
     @CheckForNull
     private <T extends Document> boolean internalCreate(Collection<T> collection, List<UpdateOp> updates) {
         try {
+            boolean success = true;
             // try up to CHUNKSIZE ops in one transaction
             for (List<UpdateOp> chunks : Lists.partition(updates, CHUNKSIZE)) {
                 List<T> docs = new ArrayList<T>();
                 for (UpdateOp update : chunks) {
+                    UpdateUtils.assertUnconditional(update);
                     T doc = collection.newDocument(this);
-                    update.increment(MODCOUNT, 1);
-                    if (hasChangesToCollisions(update)) {
-                        update.increment(COLLISIONSMODCOUNT, 1);
-                    }
-                    UpdateUtils.applyChanges(doc, update, comparator);
+                    addUpdateCounters(update);
+                    UpdateUtils.applyChanges(doc, update);
                     if (!update.getId().equals(doc.getId())) {
                         throw new DocumentStoreException("ID mismatch - UpdateOp: " + update.getId() + ", ID property: "
                                 + doc.getId());
                     }
                     docs.add(doc);
                 }
-                insertDocuments(collection, docs);
-                for (T doc : docs) {
-                    addToCache(collection, doc);
+                boolean done = insertDocuments(collection, docs);
+                if (done) {
+                    for (T doc : docs) {
+                        addToCache(collection, doc);
+                    }
+                }
+                else {
+                    success = false;
                 }
             }
-            return true;
+            return success;
         } catch (DocumentStoreException ex) {
             return false;
         }
@@ -1022,11 +925,8 @@ public class RDBDocumentStore implements DocumentStore {
             if (checkConditions && !checkConditions(doc, update.getConditions())) {
                 return null;
             }
-            update.increment(MODCOUNT, 1);
-            if (hasChangesToCollisions(update)) {
-                update.increment(COLLISIONSMODCOUNT, 1);
-            }
-            UpdateUtils.applyChanges(doc, update, comparator);
+            addUpdateCounters(update);
+            UpdateUtils.applyChanges(doc, update);
             try {
                 insertDocuments(collection, Collections.singletonList(doc));
                 addToCache(collection, doc);
@@ -1061,11 +961,11 @@ public class RDBDocumentStore implements DocumentStore {
     @CheckForNull
     private <T extends Document> T internalUpdate(Collection<T> collection, UpdateOp update, T oldDoc, boolean checkConditions,
             int maxRetries) {
-        T doc = applyChanges(collection, oldDoc, update, checkConditions);
-        if (doc == null) {
-            // conditions not met
+        if (checkConditions && !UpdateUtils.checkConditions(oldDoc, update.getConditions())) {
             return null;
         } else {
+            addUpdateCounters(update);
+            T doc = createNewDocument(collection, oldDoc, update);
             Lock l = getAndLock(update.getId());
             try {
                 boolean success = false;
@@ -1092,14 +992,15 @@ public class RDBDocumentStore implements DocumentStore {
                             return null;
                         }
 
-                        doc = applyChanges(collection, oldDoc, update, checkConditions);
-                        if (doc == null) {
+                        if (checkConditions && !UpdateUtils.checkConditions(oldDoc, update.getConditions())) {
                             return null;
                         }
-                    } else {
-                        if (collection == Collection.NODES) {
-                            applyToCache((NodeDocument) oldDoc, (NodeDocument) doc);
+                        else {
+                            addUpdateCounters(update);
+                            doc = createNewDocument(collection, oldDoc, update);
                         }
+                    } else {
+                        updateCache(collection, oldDoc, doc);
                     }
                 }
 
@@ -1115,45 +1016,58 @@ public class RDBDocumentStore implements DocumentStore {
         }
     }
 
-    @CheckForNull
-    private <T extends Document> T applyChanges(Collection<T> collection, T oldDoc, UpdateOp update, boolean checkConditions) {
+    @Nonnull
+    private <T extends Document> T createNewDocument(Collection<T> collection, T oldDoc, UpdateOp update) {
         T doc = collection.newDocument(this);
         oldDoc.deepCopy(doc);
-        if (checkConditions && !checkConditions(doc, update.getConditions())) {
-            return null;
-        }
+        UpdateUtils.applyChanges(doc, update);
+        doc.seal();
+        return doc;
+    }
+
+    private static void addUpdateCounters(UpdateOp update) {
         if (hasChangesToCollisions(update)) {
             update.increment(COLLISIONSMODCOUNT, 1);
         }
         update.increment(MODCOUNT, 1);
-        UpdateUtils.applyChanges(doc, update, comparator);
-        doc.seal();
-        return doc;
     }
 
     @CheckForNull
     private <T extends Document> void internalUpdate(Collection<T> collection, List<String> ids, UpdateOp update) {
 
         if (isAppendableUpdate(update) && !requiresPreviousState(update)) {
-            long modified = getModifiedFromUpdate(update);
-            String appendData = SR.asString(update);
+            Operation modOperation = update.getChanges().get(MODIFIEDKEY);
+            long modified = getModifiedFromOperation(modOperation);
+            boolean modifiedIsConditional = modOperation == null || modOperation.type != UpdateOp.Operation.Type.SET;
+            String appendData = ser.asString(update);
 
             for (List<String> chunkedIds : Lists.partition(ids, CHUNKSIZE)) {
-                // remember what we already have in the cache
+
+                Set<QueryContext> seenQueryContext = Collections.emptySet();
                 Map<String, NodeDocument> cachedDocs = Collections.emptyMap();
+
                 if (collection == Collection.NODES) {
+                    // remember what we already have in the cache
                     cachedDocs = new HashMap<String, NodeDocument>();
                     for (String key : chunkedIds) {
                         cachedDocs.put(key, nodesCache.getIfPresent(new StringValue(key)));
                     }
+
+                    // keep concurrently running queries from updating
+                    // the cache entry for this key
+                    seenQueryContext = new HashSet<QueryContext>();
+                    for (QueryContext qc : qmap.values()) {
+                        qc.addKeys(chunkedIds);
+                        seenQueryContext.add(qc);
+                    }
                 }
 
                 Connection connection = null;
-                String tableName = getTable(collection);
+                RDBTableMetaData tmd = getTable(collection);
                 boolean success = false;
                 try {
                     connection = this.ch.getRWConnection();
-                    success = dbBatchedAppendingUpdate(connection, tableName, chunkedIds, modified, appendData);
+                    success = db.batchedAppendingUpdate(connection, tmd, chunkedIds, modified, modifiedIsConditional, appendData);
                     connection.commit();
                 } catch (SQLException ex) {
                     success = false;
@@ -1162,17 +1076,31 @@ public class RDBDocumentStore implements DocumentStore {
                     this.ch.closeConnection(connection);
                 }
                 if (success) {
+                    if (collection == Collection.NODES) {
+                        // keep concurrently running queries from updating
+                        // the cache entry for this key
+                        for (QueryContext qc : qmap.values()) {
+                            if (!seenQueryContext.contains(qc)) {
+                                qc.addKeys(chunkedIds);
+                            }
+                        }
+                    }
                     for (Entry<String, NodeDocument> entry : cachedDocs.entrySet()) {
                         T oldDoc = castAsT(entry.getValue());
-                        if (oldDoc == null) {
-                            // make sure concurrently loaded document is
-                            // invalidated
-                            nodesCache.invalidate(new StringValue(entry.getKey()));
-                        } else {
-                            T newDoc = applyChanges(collection, oldDoc, update, true);
-                            if (newDoc != null) {
-                                applyToCache((NodeDocument) oldDoc, (NodeDocument) newDoc);
+                        String id = entry.getKey();
+                        Lock lock = getAndLock(id);
+                        try {
+                            if (oldDoc == null) {
+                                // make sure concurrently loaded document is
+                                // invalidated
+                                nodesCache.invalidate(new StringValue(id));
+                            } else {
+                                addUpdateCounters(update);
+                                T newDoc = createNewDocument(collection, oldDoc, update);
+                                updateCache(collection, oldDoc, newDoc);
                             }
+                        } finally {
+                            lock.unlock();
                         }
                     }
                 } else {
@@ -1192,11 +1120,76 @@ public class RDBDocumentStore implements DocumentStore {
         }
     }
 
+    /**
+     * Class used to track which documents may have been updated since the start
+     * of the query and thus may not put into the cache.
+     */
+    private class QueryContext {
+
+        private static final double FPP = 0.01d;
+        private static final int ENTRIES_SCOPED = 1000;
+        private static final int ENTRIES_OPEN = 10000;
+
+        private final String fromKey, toKey;
+        private volatile BloomFilter<String> filter = null;
+
+        private BloomFilter<String> getFilter() {
+            if (filter == null) {
+                synchronized (this) {
+                    if (filter == null) {
+                        filter = BloomFilter.create(new Funnel<String>() {
+                            private static final long serialVersionUID = -7114267990225941161L;
+
+                            @Override
+                            public void funnel(String from, PrimitiveSink into) {
+                                into.putUnencodedChars(from);
+                            }
+                        }, toKey.equals(NodeDocument.MAX_ID_VALUE) ? ENTRIES_OPEN : ENTRIES_SCOPED, FPP);
+                    }
+                }
+            }
+            return filter;
+        }
+
+        public QueryContext(String fromKey, String toKey) {
+            this.fromKey = fromKey;
+            this.toKey = toKey;
+        }
+
+        public void addKey(String key) {
+            if (fromKey.compareTo(key) < 0 && toKey.compareTo(key) > 0) {
+                getFilter().put(key);
+            }
+        }
+
+        public void addKeys(List<String> keys) {
+            for (String key: keys) {
+                addKey(key);
+            }
+        }
+
+        public boolean mayUpdate(String key) {
+            return filter == null ? true : !getFilter().mightContain(key);
+        }
+
+        synchronized public void dispose() {
+            if (LOG.isDebugEnabled()) {
+                if (filter != null) {
+                    LOG.debug("Disposing QueryContext for range " + fromKey + "..." + toKey + " - filter fpp was: "
+                            + filter.expectedFpp());
+                } else {
+                    LOG.debug("Disposing QueryContext for range " + fromKey + "..." + toKey + " - no filter was needed");
+                }
+            }
+        }
+    }
+
+    private Map<Thread, QueryContext> qmap = new ConcurrentHashMap<Thread, QueryContext>();
+
     private <T extends Document> List<T> internalQuery(Collection<T> collection, String fromKey, String toKey,
             String indexedProperty, long startValue, int limit) {
         Connection connection = null;
-        String tableName = getTable(collection);
-        List<T> result = new ArrayList<T>();
+        RDBTableMetaData tmd = getTable(collection);
         if (indexedProperty != null && (!INDEXEDPROPERTIES.contains(indexedProperty))) {
             String message = "indexed property " + indexedProperty + " not supported, query was '>= '" + startValue
                     + "'; supported properties are " + INDEXEDPROPERTIES;
@@ -1205,29 +1198,42 @@ public class RDBDocumentStore implements DocumentStore {
         }
         try {
             long now = System.currentTimeMillis();
+            QueryContext qp = null;
+            if (collection == Collection.NODES) {
+                qp = new QueryContext(fromKey, toKey);
+                qmap.put(Thread.currentThread(), qp);
+            }
             connection = this.ch.getROConnection();
-            List<RDBRow> dbresult = dbQuery(connection, tableName, fromKey, toKey, indexedProperty, startValue, limit);
+            String from = collection == Collection.NODES && NodeDocument.MIN_ID_VALUE.equals(fromKey) ? null : fromKey;
+            String to = collection == Collection.NODES && NodeDocument.MAX_ID_VALUE.equals(toKey) ? null : toKey;
+            List<RDBRow> dbresult = db.query(connection, tmd, from, to, indexedProperty, startValue, limit);
             connection.commit();
-            for (RDBRow r : dbresult) {
-                T doc = runThroughCache(collection, r, now);
+
+            int size = dbresult.size();
+            List<T> result = new ArrayList<T>(size);
+            for (int i = 0; i < size; i++) {
+                RDBRow row = dbresult.set(i, null); // free RDBRow ASAP
+                T doc = runThroughCache(collection, row, now, qp);
                 result.add(doc);
             }
+            if (qp != null) {
+                qp.dispose();
+            }
+            return result;
         } catch (Exception ex) {
             LOG.error("SQL exception on query", ex);
             throw new DocumentStoreException(ex);
         } finally {
+            qmap.remove(Thread.currentThread());
             this.ch.closeConnection(connection);
         }
-        return result;
     }
 
-    private <T extends Document> String getTable(Collection<T> collection) {
-        if (collection == Collection.CLUSTER_NODES) {
-            return this.tnClusterNodes;
-        } else if (collection == Collection.NODES) {
-            return this.tnNodes;
-        } else if (collection == Collection.SETTINGS) {
-            return this.tnSettings;
+    @Nonnull
+    private <T extends Document> RDBTableMetaData getTable(Collection<T> collection) {
+        RDBTableMetaData tmd = this.tableMeta.get(collection);
+        if (tmd != null) {
+            return tmd;
         } else {
             throw new IllegalArgumentException("Unknown collection: " + collection.toString());
         }
@@ -1236,14 +1242,14 @@ public class RDBDocumentStore implements DocumentStore {
     @CheckForNull
     private <T extends Document> T readDocumentUncached(Collection<T> collection, String id, NodeDocument cachedDoc) {
         Connection connection = null;
-        String tableName = getTable(collection);
+        RDBTableMetaData tmd = getTable(collection);
         try {
             long lastmodcount = -1;
             if (cachedDoc != null) {
                 lastmodcount = modcountOf(cachedDoc);
             }
             connection = this.ch.getROConnection();
-            RDBRow row = dbRead(connection, tableName, id, lastmodcount);
+            RDBRow row = db.read(connection, tmd, id, lastmodcount);
             connection.commit();
             if (row == null) {
                 return null;
@@ -1253,7 +1259,7 @@ public class RDBDocumentStore implements DocumentStore {
                     cachedDoc.markUpToDate(System.currentTimeMillis());
                     return castAsT(cachedDoc);
                 } else {
-                    return SR.fromRow(collection, row);
+                    return convertFromDBObject(collection, row);
                 }
             }
         } catch (Exception ex) {
@@ -1265,10 +1271,10 @@ public class RDBDocumentStore implements DocumentStore {
 
     private <T extends Document> void delete(Collection<T> collection, String id) {
         Connection connection = null;
-        String tableName = getTable(collection);
+        RDBTableMetaData tmd = getTable(collection);
         try {
             connection = this.ch.getRWConnection();
-            dbDelete(connection, tableName, Collections.singletonList(id));
+            db.delete(connection, tmd, Collections.singletonList(id));
             connection.commit();
         } catch (Exception ex) {
             throw new DocumentStoreException(ex);
@@ -1279,12 +1285,12 @@ public class RDBDocumentStore implements DocumentStore {
 
     private <T extends Document> int delete(Collection<T> collection, List<String> ids) {
         int numDeleted = 0;
+        RDBTableMetaData tmd = getTable(collection);
         for (List<String> sublist : Lists.partition(ids, 64)) {
             Connection connection = null;
-            String tableName = getTable(collection);
             try {
                 connection = this.ch.getRWConnection();
-                numDeleted += dbDelete(connection, tableName, sublist);
+                numDeleted += db.delete(connection, tmd, sublist);
                 connection.commit();
             } catch (Exception ex) {
                 throw new DocumentStoreException(ex);
@@ -1298,7 +1304,7 @@ public class RDBDocumentStore implements DocumentStore {
     private <T extends Document> int delete(Collection<T> collection,
                                             Map<String, Map<Key, Condition>> toRemove) {
         int numDeleted = 0;
-        String tableName = getTable(collection);
+        RDBTableMetaData tmd = getTable(collection);
         Map<String, Map<Key, Condition>> subMap = Maps.newHashMap();
         Iterator<Entry<String, Map<Key, Condition>>> it = toRemove.entrySet().iterator();
         while (it.hasNext()) {
@@ -1308,7 +1314,7 @@ public class RDBDocumentStore implements DocumentStore {
                 Connection connection = null;
                 try {
                     connection = this.ch.getRWConnection();
-                    numDeleted += dbDelete(connection, tableName, subMap);
+                    numDeleted += db.delete(connection, tmd, subMap);
                     connection.commit();
                 } catch (Exception ex) {
                     throw DocumentStoreException.convert(ex);
@@ -1324,10 +1330,13 @@ public class RDBDocumentStore implements DocumentStore {
     private <T extends Document> boolean updateDocument(@Nonnull Collection<T> collection, @Nonnull T document,
             @Nonnull UpdateOp update, Long oldmodcount) {
         Connection connection = null;
-        String tableName = getTable(collection);
+        RDBTableMetaData tmd = getTable(collection);
+        String data = null;
         try {
             connection = this.ch.getRWConnection();
-            Long modified = (Long) document.get(MODIFIED);
+            Operation modOperation = update.getChanges().get(MODIFIEDKEY);
+            long modified = getModifiedFromOperation(modOperation);
+            boolean modifiedIsConditional = modOperation == null || modOperation.type != UpdateOp.Operation.Type.SET;
             Number flagB = (Number) document.get(NodeDocument.HAS_BINARY_FLAG);
             Boolean hasBinary = flagB != null && flagB.intValue() == NodeDocument.HAS_BINARY_VAL;
             Boolean flagD = (Boolean) document.get(NodeDocument.DELETED_ONCE);
@@ -1335,14 +1344,20 @@ public class RDBDocumentStore implements DocumentStore {
             Long modcount = (Long) document.get(MODCOUNT);
             Long cmodcount = (Long) document.get(COLLISIONSMODCOUNT);
             boolean success = false;
+            boolean shouldRetry = true;
 
             // every 16th update is a full rewrite
             if (isAppendableUpdate(update) && modcount % 16 != 0) {
-                String appendData = SR.asString(update);
-                if (appendData.length() < this.dataLimitInOctets / CHAR2OCTETRATIO) {
+                String appendData = ser.asString(update);
+                if (appendData.length() < tmd.getDataLimitInOctets() / CHAR2OCTETRATIO) {
                     try {
-                        success = dbAppendingUpdate(connection, tableName, document.getId(), modified, hasBinary, deletedOnce,
-                                modcount, cmodcount, oldmodcount, appendData);
+                        success = db.appendingUpdate(connection, tmd, document.getId(), modified, modifiedIsConditional, hasBinary,
+                                deletedOnce, modcount, cmodcount, oldmodcount, appendData);
+                        // if we get here, a retry is not going to help (the SQL
+                        // operation succeeded but simply did not select a row
+                        // that could be updated, likely because of the check on
+                        // MODCOUNT
+                        shouldRetry = false;
                         connection.commit();
                     } catch (SQLException ex) {
                         continueIfStringOverflow(ex);
@@ -1351,16 +1366,24 @@ public class RDBDocumentStore implements DocumentStore {
                     }
                 }
             }
-            if (!success) {
-                String data = SR.asString(document);
-                success = dbUpdate(connection, tableName, document.getId(), modified, hasBinary, deletedOnce, modcount, cmodcount,
+            if (!success && shouldRetry) {
+                data = ser.asString(document);
+                success = db.update(connection, tmd, document.getId(), modified, hasBinary, deletedOnce, modcount, cmodcount,
                         oldmodcount, data);
                 connection.commit();
             }
             return success;
         } catch (SQLException ex) {
             this.ch.rollbackConnection(connection);
-            throw new DocumentStoreException(ex);
+            String addDiags = "";
+            if (RDBJDBCTools.matchesSQLState(ex, "22", "72")) {
+                byte[] bytes = asBytes(data);
+                addDiags = String.format(" (DATA size in Java characters: %d, in octets: %d, computed character limit: %d)",
+                        data.length(), bytes.length, tmd.getDataLimitInOctets() / CHAR2OCTETRATIO);
+            }
+            String message = String.format("Update for %s failed%s", document.getId(), addDiags);
+            LOG.debug(message, ex);
+            throw new DocumentStoreException(message, ex);
         } finally {
             this.ch.closeConnection(connection);
         }
@@ -1391,42 +1414,63 @@ public class RDBDocumentStore implements DocumentStore {
         return !update.getConditions().isEmpty();
     }
 
-    private static long getModifiedFromUpdate(UpdateOp update) {
-        for (Map.Entry<Key, Operation> change : update.getChanges().entrySet()) {
-            Operation op = change.getValue();
-            if (op.type == UpdateOp.Operation.Type.MAX || op.type == UpdateOp.Operation.Type.SET) {
-                if (MODIFIED.equals(change.getKey().getName())) {
-                    return Long.parseLong(op.value.toString());
-                }
-            }
-        }
-        return 0L;
+    private static long getModifiedFromOperation(Operation op) {
+        return op == null ? 0L : Long.parseLong(op.value.toString());
     }
 
-    private <T extends Document> void insertDocuments(Collection<T> collection, List<T> documents) {
+    private <T extends Document> boolean insertDocuments(Collection<T> collection, List<T> documents) {
         Connection connection = null;
-        String tableName = getTable(collection);
-        List<String> ids = new ArrayList<String>();
+        RDBTableMetaData tmd = getTable(collection);
         try {
             connection = this.ch.getRWConnection();
-            for (T document : documents) {
-                String data = SR.asString(document);
-                Long modified = (Long) document.get(MODIFIED);
-                Number flagB = (Number) document.get(NodeDocument.HAS_BINARY_FLAG);
-                Boolean hasBinary = flagB != null && flagB.intValue() == NodeDocument.HAS_BINARY_VAL;
-                Boolean flagD = (Boolean) document.get(NodeDocument.DELETED_ONCE);
-                Boolean deletedOnce = flagD != null && flagD.booleanValue();
-                Long modcount = (Long) document.get(MODCOUNT);
-                Long cmodcount = (Long) document.get(COLLISIONSMODCOUNT);
-                String id = document.getId();
-                ids.add(id);
-                dbInsert(connection, tableName, id, modified, hasBinary, deletedOnce, modcount, cmodcount, data);
-            }
+            boolean result = db.insert(connection, tmd, documents);
             connection.commit();
+            return result;
         } catch (SQLException ex) {
-            LOG.debug("insert of " + ids + " failed", ex);
             this.ch.rollbackConnection(connection);
-            throw new DocumentStoreException(ex);
+
+            List<String> ids = new ArrayList<String>();
+            for (T doc : documents) {
+                ids.add(doc.getId());
+            }
+            String message = String.format("insert of %s failed", ids);
+            LOG.debug(message, ex);
+
+            // collect additional exceptions
+            String messages = LOG.isDebugEnabled() ? RDBJDBCTools.getAdditionalMessages(ex) : "";
+
+            // see whether a DATA error was involved
+            boolean dataRelated = false;
+            SQLException walk = ex;
+            while (walk != null && !dataRelated) {
+                dataRelated = RDBJDBCTools.matchesSQLState(walk, "22", "72");
+                walk = walk.getNextException();
+            }
+            if (dataRelated) {
+                String id = null;
+                int longest = 0, longestChars = 0;
+
+                for (Document d : documents) {
+                    String data = ser.asString(d);
+                    byte bytes[] = asBytes(data);
+                    if (bytes.length > longest) {
+                        longest = bytes.length;
+                        longestChars = data.length();
+                        id = d.getId();
+                    }
+                }
+
+                String m = String
+                        .format(" (potential cause: long data for ID %s - longest octet DATA size in Java characters: %d, in octets: %d, computed character limit: %d)",
+                                id, longest, longestChars, tmd.getDataLimitInOctets() / CHAR2OCTETRATIO);
+                messages += m;
+            }
+
+            if (!messages.isEmpty()) {
+                LOG.debug("additional diagnostics: " + messages);
+            }
+
+            throw new DocumentStoreException(message, ex);
         } finally {
             this.ch.closeConnection(connection);
         }
@@ -1440,8 +1484,14 @@ public class RDBDocumentStore implements DocumentStore {
     // Number of documents to insert at once for batch create
     private static final int CHUNKSIZE = Integer.getInteger(
             "org.apache.jackrabbit.oak.plugins.document.rdb.RDBDocumentStore.CHUNKSIZE", 64);
+    // Number of query hits above which a diagnostic warning is generated
+    private static final int QUERYHITSLIMIT = Integer.getInteger(
+            "org.apache.jackrabbit.oak.plugins.document.rdb.RDBDocumentStore.QUERYHITSLIMIT", 4096);
+    // Number of elapsed ms in a query above which a diagnostic warning is generated
+    private static final int QUERYTIMELIMIT = Integer.getInteger(
+            "org.apache.jackrabbit.oak.plugins.document.rdb.RDBDocumentStore.QUERYTIMELIMIT", 10000);
 
-    private static byte[] asBytes(String data) {
+    public static byte[] asBytes(String data) {
         byte[] bytes;
         try {
             bytes = data.getBytes("UTF-8");
@@ -1471,383 +1521,6 @@ public class RDBDocumentStore implements DocumentStore {
         }
     }
 
-    private void setIdInStatement(PreparedStatement stmt, int idx, String id) throws SQLException {
-        if (db.isPrimaryColumnByteEncoded()) {
-            try {
-                stmt.setBytes(idx, id.getBytes("UTF-8"));
-            } catch (UnsupportedEncodingException ex) {
-                LOG.error("UTF-8 not supported??", ex);
-                throw new DocumentStoreException(ex);
-            }
-        } else {
-            stmt.setString(idx, id);
-        }
-    }
-
-    private String getIdFromRS(ResultSet rs, int idx) throws SQLException {
-        String id;
-        if (db.isPrimaryColumnByteEncoded()) {
-            try {
-                id = new String(rs.getBytes(idx), "UTF-8");
-
-            } catch (UnsupportedEncodingException ex) {
-                LOG.error("UTF-8 not supported??", ex);
-                throw new DocumentStoreException(ex);
-            }
-        } else {
-            id = rs.getString(idx);
-        }
-        return id;
-    }
-
-    @CheckForNull
-    private RDBRow dbRead(Connection connection, String tableName, String id, long lastmodcount) throws SQLException {
-        PreparedStatement stmt;
-        boolean useCaseStatement = lastmodcount != -1 && this.db.allowsCaseInSelect();
-        if (useCaseStatement) {
-            // either we don't have a previous version of the document
-            // or the database does not support CASE in SELECT
-            stmt = connection.prepareStatement("select MODIFIED, MODCOUNT, CMODCOUNT, HASBINARY, DELETEDONCE, DATA, BDATA from "
-                    + tableName + " where ID = ?");
-        } else {
-            // the case statement causes the actual row data not to be
-            // sent in case we already have it
-            stmt = connection
-                    .prepareStatement("select MODIFIED, MODCOUNT, CMODCOUNT, HASBINARY, DELETEDONCE, case MODCOUNT when ? then null else DATA end as DATA, "
-                            + "case MODCOUNT when ? then null else BDATA end as BDATA from " + tableName + " where ID = ?");
-        }
-
-        try {
-            if (useCaseStatement) {
-                setIdInStatement(stmt, 1, id);
-            }
-            else {
-                stmt.setLong(1, lastmodcount);
-                stmt.setLong(2, lastmodcount);
-                setIdInStatement(stmt, 3, id);
-            }
-            ResultSet rs = stmt.executeQuery();
-            if (rs.next()) {
-                long modified = rs.getLong(1);
-                long modcount = rs.getLong(2);
-                long cmodcount = rs.getLong(3);
-                long hasBinary = rs.getLong(4);
-                long deletedOnce = rs.getLong(5);
-                String data = rs.getString(6);
-                byte[] bdata = rs.getBytes(7);
-                return new RDBRow(id, hasBinary == 1, deletedOnce == 1, modified, modcount, cmodcount, data, bdata);
-            } else {
-                return null;
-            }
-        } catch (SQLException ex) {
-            LOG.error("attempting to read " + id + " (id length is " + id.length() + ")", ex);
-            // DB2 throws an SQLException for invalid keys; handle this more
-            // gracefully
-            if ("22001".equals(ex.getSQLState())) {
-                this.ch.rollbackConnection(connection);
-                return null;
-            } else {
-                throw (ex);
-            }
-        } finally {
-            stmt.close();
-        }
-    }
-
-    private List<RDBRow> dbQuery(Connection connection, String tableName, String minId, String maxId, String indexedProperty,
-            long startValue, int limit) throws SQLException {
-        String t = "select ";
-        if (limit != Integer.MAX_VALUE && this.db.getFetchFirstSyntax() == FETCHFIRSTSYNTAX.TOP) {
-            t += "TOP " + limit +  " ";
-        }
-        t += "ID, MODIFIED, MODCOUNT, CMODCOUNT, HASBINARY, DELETEDONCE, DATA, BDATA from " + tableName
-                + " where ID > ? and ID < ?";
-        if (indexedProperty != null) {
-            if (MODIFIED.equals(indexedProperty)) {
-                t += " and MODIFIED >= ?";
-            } else if (NodeDocument.HAS_BINARY_FLAG.equals(indexedProperty)) {
-                if (startValue != NodeDocument.HAS_BINARY_VAL) {
-                    throw new DocumentStoreException("unsupported value for property " + NodeDocument.HAS_BINARY_FLAG);
-                }
-                t += " and HASBINARY = 1";
-            } else if (NodeDocument.DELETED_ONCE.equals(indexedProperty)) {
-                if (startValue != 1) {
-                    throw new DocumentStoreException("unsupported value for property " + NodeDocument.DELETED_ONCE);
-                }
-                t += " and DELETEDONCE = 1";
-            } else {
-                throw new DocumentStoreException("unsupported indexed property: " + indexedProperty);
-            }
-        }
-        t += " order by ID";
-
-        if (limit != Integer.MAX_VALUE) {
-            switch (this.db.getFetchFirstSyntax()) {
-                case LIMIT:
-                    t += " LIMIT " + limit;
-                    break;
-                case FETCHFIRST:
-                    t += " FETCH FIRST " + limit + " ROWS ONLY";
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        PreparedStatement stmt = connection.prepareStatement(t);
-        List<RDBRow> result = new ArrayList<RDBRow>();
-        try {
-            int si = 1;
-            setIdInStatement(stmt, si++, minId);
-            setIdInStatement(stmt, si++, maxId);
-
-            if (MODIFIED.equals(indexedProperty)) {
-                stmt.setLong(si++, startValue);
-            }
-            if (limit != Integer.MAX_VALUE) {
-                stmt.setFetchSize(limit);
-            }
-            ResultSet rs = stmt.executeQuery();
-            while (rs.next() && result.size() < limit) {
-                String id = getIdFromRS(rs, 1);
-
-                if (id.compareTo(minId) < 0 || id.compareTo(maxId) > 0) {
-                    throw new DocumentStoreException("unexpected query result: '" + minId + "' < '" + id + "' < '" + maxId
-                            + "' - broken DB collation?");
-                }
-                long modified = rs.getLong(2);
-                long modcount = rs.getLong(3);
-                long cmodcount = rs.getLong(4);
-                long hasBinary = rs.getLong(5);
-                long deletedOnce = rs.getLong(6);
-                String data = rs.getString(7);
-                byte[] bdata = rs.getBytes(8);
-                result.add(new RDBRow(id, hasBinary == 1, deletedOnce == 1, modified, modcount, cmodcount, data, bdata));
-            }
-        } finally {
-            stmt.close();
-        }
-        return result;
-    }
-
-    private boolean dbUpdate(Connection connection, String tableName, String id, Long modified, Boolean hasBinary,
-            Boolean deletedOnce, Long modcount, Long cmodcount, Long oldmodcount, String data) throws SQLException {
-        String t = "update "
-                + tableName
-                + " set MODIFIED = ?, HASBINARY = ?, DELETEDONCE = ?, MODCOUNT = ?, CMODCOUNT = ?, DSIZE = ?, DATA = ?, BDATA = ? where ID = ?";
-        if (oldmodcount != null) {
-            t += " and MODCOUNT = ?";
-        }
-        PreparedStatement stmt = connection.prepareStatement(t);
-        try {
-            int si = 1;
-            stmt.setObject(si++, modified, Types.BIGINT);
-            stmt.setObject(si++, hasBinary ? 1 : 0, Types.SMALLINT);
-            stmt.setObject(si++, deletedOnce ? 1 : 0, Types.SMALLINT);
-            stmt.setObject(si++, modcount, Types.BIGINT);
-            stmt.setObject(si++, cmodcount == null ? Long.valueOf(0) : cmodcount, Types.BIGINT);
-            stmt.setObject(si++, data.length(), Types.BIGINT);
-
-            if (data.length() < this.dataLimitInOctets / CHAR2OCTETRATIO) {
-                stmt.setString(si++, data);
-                stmt.setBinaryStream(si++, null, 0);
-            } else {
-                stmt.setString(si++, "\"blob\"");
-                byte[] bytes = asBytes(data);
-                stmt.setBytes(si++, bytes);
-            }
-
-            setIdInStatement(stmt, si++, id);
-
-            if (oldmodcount != null) {
-                stmt.setObject(si++, oldmodcount, Types.BIGINT);
-            }
-            int result = stmt.executeUpdate();
-            if (result != 1) {
-                LOG.debug("DB update failed for " + tableName + "/" + id + " with oldmodcount=" + oldmodcount);
-            }
-            return result == 1;
-        } finally {
-            stmt.close();
-        }
-    }
-
-    private boolean dbAppendingUpdate(Connection connection, String tableName, String id, Long modified, Boolean hasBinary,
-            Boolean deletedOnce, Long modcount, Long cmodcount, Long oldmodcount, String appendData) throws SQLException {
-        StringBuilder t = new StringBuilder();
-        t.append("update " + tableName + " set MODIFIED = " + this.db.getGreatestQueryString("MODIFIED")
-                + ", HASBINARY = ?, DELETEDONCE = ?, MODCOUNT = ?, CMODCOUNT = ?, DSIZE = DSIZE + ?, ");
-        t.append("DATA = " + this.db.getConcatQueryString(this.dataLimitInOctets, appendData.length()) + " ");
-        t.append("where ID = ?");
-        if (oldmodcount != null) {
-            t.append(" and MODCOUNT = ?");
-        }
-        PreparedStatement stmt = connection.prepareStatement(t.toString());
-        try {
-            int si = 1;
-            stmt.setObject(si++, modified, Types.BIGINT);
-            stmt.setObject(si++, hasBinary ? 1 : 0, Types.SMALLINT);
-            stmt.setObject(si++, deletedOnce ? 1 : 0, Types.SMALLINT);
-            stmt.setObject(si++, modcount, Types.BIGINT);
-            stmt.setObject(si++, cmodcount == null ? Long.valueOf(0) : cmodcount, Types.BIGINT);
-            stmt.setObject(si++, 1 + appendData.length(), Types.BIGINT);
-            stmt.setString(si++, "," + appendData);
-            setIdInStatement(stmt, si++, id);
-
-            if (oldmodcount != null) {
-                stmt.setObject(si++, oldmodcount, Types.BIGINT);
-            }
-            int result = stmt.executeUpdate();
-            if (result != 1) {
-                LOG.debug("DB append update failed for " + tableName + "/" + id + " with oldmodcount=" + oldmodcount);
-            }
-            return result == 1;
-        } finally {
-            stmt.close();
-        }
-    }
-
-    private boolean dbBatchedAppendingUpdate(Connection connection, String tableName, List<String> ids, Long modified,
-            String appendData) throws SQLException {
-        StringBuilder t = new StringBuilder();
-        t.append("update " + tableName + " set MODIFIED = " + this.db.getGreatestQueryString("MODIFIED")
-                + ", MODCOUNT = MODCOUNT + 1, DSIZE = DSIZE + ?, ");
-        t.append("DATA = " + this.db.getConcatQueryString(this.dataLimitInOctets, appendData.length()) + " ");
-        t.append("where ID in (");
-        for (int i = 0; i < ids.size(); i++) {
-            if (i != 0) {
-                t.append(',');
-            }
-            t.append('?');
-        }
-        t.append(")");
-        PreparedStatement stmt = connection.prepareStatement(t.toString());
-        try {
-            int si = 1;
-            stmt.setObject(si++, modified, Types.BIGINT);
-            stmt.setObject(si++, 1 + appendData.length(), Types.BIGINT);
-            stmt.setString(si++, "," + appendData);
-            for (String id : ids) {
-                setIdInStatement(stmt, si++, id);
-            }
-            int result = stmt.executeUpdate();
-            if (result != ids.size()) {
-                LOG.debug("DB update failed: only " + result + " of " + ids.size() + " updated. Table: " + tableName + ", IDs:"
-                        + ids);
-            }
-            return result == ids.size();
-        } finally {
-            stmt.close();
-        }
-    }
-
-    private boolean dbInsert(Connection connection, String tableName, String id, Long modified, Boolean hasBinary,
-            Boolean deletedOnce, Long modcount, Long cmodcount, String data) throws SQLException {
-        PreparedStatement stmt = connection.prepareStatement("insert into " + tableName
-                + "(ID, MODIFIED, HASBINARY, DELETEDONCE, MODCOUNT, CMODCOUNT, DSIZE, DATA, BDATA) values (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        try {
-            int si = 1;
-            setIdInStatement(stmt, si++, id);
-            stmt.setObject(si++, modified, Types.BIGINT);
-            stmt.setObject(si++, hasBinary ? 1 : 0, Types.SMALLINT);
-            stmt.setObject(si++, deletedOnce ? 1 : 0, Types.SMALLINT);
-            stmt.setObject(si++, modcount, Types.BIGINT);
-            stmt.setObject(si++, cmodcount == null ? Long.valueOf(0) : cmodcount, Types.BIGINT);
-            stmt.setObject(si++, data.length(), Types.BIGINT);
-            if (data.length() < this.dataLimitInOctets / CHAR2OCTETRATIO) {
-                stmt.setString(si++, data);
-                stmt.setBinaryStream(si++, null, 0);
-            } else {
-                stmt.setString(si++, "\"blob\"");
-                byte[] bytes = asBytes(data);
-                stmt.setBytes(si++, bytes);
-            }
-            int result = stmt.executeUpdate();
-            if (result != 1) {
-                LOG.debug("DB insert failed for " + tableName + "/" + id);
-            }
-            return result == 1;
-        } finally {
-            stmt.close();
-        }
-    }
-
-    private int dbDelete(Connection connection, String tableName, List<String> ids) throws SQLException {
-
-        PreparedStatement stmt;
-        int cnt = ids.size();
-
-        if (cnt == 1) {
-            stmt = connection.prepareStatement("delete from " + tableName + " where ID=?");
-        } else {
-            StringBuilder inClause = new StringBuilder();
-            for (int i = 0; i < cnt; i++) {
-                inClause.append('?');
-                if (i != cnt - 1) {
-                    inClause.append(',');
-                }
-            }
-            stmt = connection.prepareStatement("delete from " + tableName + " where ID in (" + inClause.toString() + ")");
-        }
-
-        try {
-            for (int i = 0; i < cnt; i++) {
-                setIdInStatement(stmt, i + 1, ids.get(i));
-            }
-            int result = stmt.executeUpdate();
-            if (result != cnt) {
-                LOG.debug("DB delete failed for " + tableName + "/" + ids);
-            }
-            return result;
-        } finally {
-            stmt.close();
-        }
-    }
-
-    private int dbDelete(Connection connection, String tableName,
-                         Map<String, Map<Key, Condition>> toDelete)
-            throws SQLException, DocumentStoreException {
-        String or = "";
-        StringBuilder whereClause = new StringBuilder();
-        for (Entry<String, Map<Key, Condition>> entry : toDelete.entrySet()) {
-            whereClause.append(or);
-            or = " or ";
-            whereClause.append("ID=?");
-            for (Entry<Key, Condition> c : entry.getValue().entrySet()) {
-                if (!c.getKey().getName().equals(MODIFIED)) {
-                    throw new DocumentStoreException(
-                            "Unsupported condition: " + c);
-                }
-                whereClause.append(" and MODIFIED");
-                if (c.getValue().type == Condition.Type.EQUALS
-                        && c.getValue().value instanceof Long) {
-                    whereClause.append("=?");
-                } else if (c.getValue().type == Condition.Type.EXISTS) {
-                    whereClause.append(" is not null");
-                } else {
-                    throw new DocumentStoreException(
-                            "Unsupported condition: " + c);
-                }
-            }
-        }
-
-        PreparedStatement stmt= connection.prepareStatement(
-                "delete from " + tableName + " where " + whereClause);
-        try {
-            int i = 1;
-            for (Entry<String, Map<Key, Condition>> entry : toDelete.entrySet()) {
-                setIdInStatement(stmt, i++, entry.getKey());
-                for (Entry<Key, Condition> c : entry.getValue().entrySet()) {
-                    if (c.getValue().type == Condition.Type.EQUALS) {
-                        stmt.setLong(i++, (Long) c.getValue().value);
-                    }
-                }
-            }
-            return stmt.executeUpdate();
-        } finally {
-            stmt.close();
-        }
-    }
 
     @Override
     public void setReadWriteMode(String readWriteMode) {
@@ -1894,14 +1567,65 @@ public class RDBDocumentStore implements DocumentStore {
         return n != null ? n.longValue() : -1;
     }
 
+    private <T extends Document> void addToCache(Collection<T> collection, T doc) {
+        if (collection == Collection.NODES) {
+            Lock lock = getAndLock(idOf(doc));
+            try {
+                addToCache((NodeDocument) doc);
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+
     /**
-     * Adds a document to the {@link #nodesCache} iff there is no document in
-     * the cache with the document key. This method does not acquire a lock from
-     * {@link #locks}! The caller must ensure a lock is held for the given
-     * document.
-     * 
-     * @param doc
-     *            the document to add to the cache.
+     * Applies an update to the nodes cache. This method does not acquire
+     * a lock for the document. The caller must ensure it holds a lock for
+     * the updated document. See striped {@link #locks}.
+     *
+     * @param <T> the document type.
+     * @param collection the document collection.
+     * @param oldDoc the old document.
+     * @param updateOp the update operation.
+     */
+    private <T extends Document> void updateCache(@Nonnull Collection<T> collection,
+                                                  @Nonnull T oldDoc,
+                                                  @Nonnull T newDoc) {
+        // cache the new document
+        if (collection == Collection.NODES) {
+            checkNotNull(oldDoc);
+            checkNotNull(newDoc);
+            // we can only update the cache based on the oldDoc if we
+            // still have the oldDoc in the cache, otherwise we may
+            // update the cache with an outdated document
+            CacheValue key = new StringValue(idOf(newDoc));
+            NodeDocument cached = nodesCache.getIfPresent(key);
+            if (cached == null) {
+                // cannot use oldDoc to update cache
+                return;
+            }
+
+            // check if the currently cached document matches oldDoc
+            if (Objects.equal(cached.getModCount(), oldDoc.getModCount())) {
+                nodesCache.put(key, (NodeDocument)newDoc);
+            } else {
+                // the cache entry was modified by some other thread in
+                // the meantime. the updated cache entry may or may not
+                // include this update. we cannot just apply our update
+                // on top of the cached entry.
+                // therefore we must invalidate the cache entry
+                nodesCache.invalidate(key);
+            }
+        }
+    }
+
+    /**
+     * Adds a document to the {@link #nodesCache} iff there is no document
+     * in the cache with the document key. This method does not acquire a lock
+     * from {@link #locks}! The caller must ensure a lock is held for the
+     * given document.
+     *
+     * @param doc the document to add to the cache.
      * @return either the given <code>doc</code> or the document already present
      *         in the cache.
      */
@@ -1938,47 +1662,16 @@ public class RDBDocumentStore implements DocumentStore {
     }
 
     @Nonnull
-    private void applyToCache(@Nonnull final NodeDocument oldDoc, @Nonnull final NodeDocument newDoc) {
-        NodeDocument cached = addToCache(newDoc);
-        if (cached == newDoc) {
-            // successful
-            return;
-        } else if (oldDoc == null) {
-            // this is an insert and some other thread was quicker
-            // loading it into the cache -> return now
-            return;
-        } else {
-            CacheValue key = new StringValue(idOf(newDoc));
-            // this is an update (oldDoc != null)
-            if (Objects.equal(cached.getModCount(), oldDoc.getModCount())) {
-                nodesCache.put(key, newDoc);
-            } else {
-                // the cache entry was modified by some other thread in
-                // the meantime. the updated cache entry may or may not
-                // include this update. we cannot just apply our update
-                // on top of the cached entry.
-                // therefore we must invalidate the cache entry
-                nodesCache.invalidate(key);
-            }
-        }
+    protected <T extends Document> T convertFromDBObject(@Nonnull Collection<T> collection, @Nonnull RDBRow row) {
+        // this method is present here in order to facilitate unit testing for OAK-3566
+        return ser.fromRow(collection, row);
     }
 
-    private <T extends Document> void addToCache(Collection<T> collection, T doc) {
-        if (collection == Collection.NODES) {
-            Lock lock = getAndLock(idOf(doc));
-            try {
-                addToCache((NodeDocument) doc);
-            } finally {
-                lock.unlock();
-            }
-        }
-    }
-
-    private <T extends Document> T runThroughCache(Collection<T> collection, RDBRow row, long now) {
+    private <T extends Document> T runThroughCache(Collection<T> collection, RDBRow row, long now, QueryContext qp) {
 
         if (collection != Collection.NODES) {
             // not in the cache anyway
-            return SR.fromRow(collection, row);
+            return convertFromDBObject(collection, row);
         }
 
         String id = row.getId();
@@ -2001,8 +1694,12 @@ public class RDBDocumentStore implements DocumentStore {
             }
         }
 
-        NodeDocument fresh = (NodeDocument) SR.fromRow(collection, row);
+        NodeDocument fresh = (NodeDocument) convertFromDBObject(collection, row);
         fresh.seal();
+
+        if (!qp.mayUpdate(id)) {
+            return castAsT(fresh);
+        }
 
         Lock lock = getAndLock(id);
         try {
@@ -2027,18 +1724,24 @@ public class RDBDocumentStore implements DocumentStore {
         return castAsT(fresh);
     }
 
-    private boolean hasChangesToCollisions(UpdateOp update) {
-        if (! USECMODCOUNT) return false;
-
-        for (Entry<Key, Operation> e : checkNotNull(update).getChanges().entrySet()) {
-            Key k = e.getKey();
-            Operation op = e.getValue();
-            if (op.type == Operation.Type.SET_MAP_ENTRY) {
-                if (NodeDocument.COLLISIONS.equals(k.getName())) {
-                    return true;
+    private static boolean hasChangesToCollisions(UpdateOp update) {
+        if (!USECMODCOUNT) {
+            return false;
+        } else {
+            for (Entry<Key, Operation> e : checkNotNull(update).getChanges().entrySet()) {
+                Key k = e.getKey();
+                Operation op = e.getValue();
+                if (op.type == Operation.Type.SET_MAP_ENTRY) {
+                    if (NodeDocument.COLLISIONS.equals(k.getName())) {
+                        return true;
+                    }
                 }
             }
+            return false;
         }
-        return false;
+    }
+
+    protected Cache<CacheValue, NodeDocument> getNodeDocumentCache() {
+        return nodesCache;
     }
 }
